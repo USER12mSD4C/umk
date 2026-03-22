@@ -7,8 +7,10 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
-#include <fcntl.h>
+#include <sys/types.h>
+#include <time.h>
 #include <errno.h>
+#include <pthread.h>
 
 #define MAX_LINE 4096
 #define MAX_NAME 256
@@ -57,6 +59,8 @@ typedef struct Command {
     int main_cmd_count;
     Flag *flags;
     struct Command *next;
+    int is_phony;
+    time_t last_build;
 } Command;
 
 typedef struct Variable {
@@ -67,7 +71,6 @@ typedef struct Variable {
 
 typedef struct Job {
     char *command;
-    int job_id;
     pid_t pid;
     int ret;
     struct Job *next;
@@ -78,12 +81,12 @@ Variable *variables = NULL;
 PatternRule *pattern_rules = NULL;
 int use_color = 1;
 int jobs = 1;
-int jobs_running = 0;
+int dry_run = 0;
 Job *job_queue = NULL;
 
 void trim(char *str);
 int is_blank(const char *str);
-char *expand_string(const char *str);
+char *expand_string(const char *str, int for_dependency);
 ExprNode *parse_expr(const char *str);
 char *eval_expr(ExprNode *node);
 void free_expr(ExprNode *node);
@@ -98,17 +101,22 @@ void add_pattern_rule(const char *target, const char *dep, const char *cmd);
 void parse_umkfile(const char *filename);
 int evaluate_condition(const char *expr);
 int execute_command(const char *cmd_name, int argc, char **argv);
-int execute_commands(char **cmds, int cmd_count);
+int execute_commands(char **cmds, int cmd_count, int check_timestamp);
+int execute_single_command(const char *cmd);
 int execute_flag(Flag *flag);
-int execute_single_command(const char *cmd, int *job_id);
+int execute_pattern_rule(const char *target, PatternRule *rule);
+int needs_rebuild(const char *target, char **deps, int dep_count);
+time_t get_mtime(const char *path);
+void collect_dependencies(const char *pattern, char ***deps, int *dep_count);
+char **split_deps(const char *dep_str, int *count);
 void run_jobs_parallel(void);
 void add_job(const char *cmd);
-void wait_for_jobs(void);
+void clear_jobs(void);
 char *wildcard(const char *pattern);
 char *shell(const char *cmd);
 void print_color(const char *color, const char *msg);
 int match_pattern(const char *name, const char *pattern);
-char *apply_pattern_rule(const char *target, PatternRule *rule);
+char *apply_pattern(const char *target, const char *pattern);
 
 typedef struct {
     char *name;
@@ -148,6 +156,14 @@ int is_blank(const char *str) {
         str++;
     }
     return 1;
+}
+
+time_t get_mtime(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return st.st_mtime;
+    }
+    return 0;
 }
 
 void print_color(const char *color, const char *msg) {
@@ -229,21 +245,24 @@ int match_pattern(const char *name, const char *pattern) {
     return *n == '\0';
 }
 
-char *apply_pattern_rule(const char *target, PatternRule *rule) {
+char *apply_pattern(const char *target, const char *pattern) {
     static char result[MAX_LINE];
-    char *star_pos = strchr(rule->target_pattern, '*');
-    if (!star_pos) return NULL;
+    char *star_pos = (char*)strchr(pattern, '*');
+    if (!star_pos) {
+        strcpy(result, pattern);
+        return result;
+    }
     
-    int prefix_len = star_pos - rule->target_pattern;
-    int suffix_len = strlen(rule->target_pattern) - (prefix_len + 1);
+    int prefix_len = star_pos - pattern;
+    int suffix_len = strlen(pattern) - (prefix_len + 1);
     
-    if (strncmp(target, rule->target_pattern, prefix_len) != 0) return NULL;
+    if (strncmp(target, pattern, prefix_len) != 0) return NULL;
     
     int target_len = strlen(target);
     if (target_len < prefix_len + suffix_len) return NULL;
     
     if (suffix_len > 0) {
-        const char *suffix = rule->target_pattern + prefix_len + 1;
+        const char *suffix = pattern + prefix_len + 1;
         if (strcmp(target + target_len - suffix_len, suffix) != 0) return NULL;
     }
     
@@ -252,29 +271,79 @@ char *apply_pattern_rule(const char *target, PatternRule *rule) {
     strncpy(stem, target + prefix_len, stem_len);
     stem[stem_len] = '\0';
     
-    char dep_pattern[MAX_LINE];
-    strcpy(dep_pattern, rule->dep_pattern);
+    strcpy(result, stem);
+    return result;
+}
+
+void collect_dependencies(const char *pattern, char ***deps, int *dep_count) {
+    *deps = NULL;
+    *dep_count = 0;
     
-    char *dep_result = malloc(MAX_LINE);
-    char *p = dep_pattern;
-    char *out = dep_result;
-    while (*p) {
-        if (*p == '*' && (p == dep_pattern || *(p-1) != '$')) {
-            strcpy(out, stem);
-            out += strlen(stem);
-            p++;
-        } else if (*p == '$' && *(p+1) == '*') {
-            strcpy(out, stem);
-            out += strlen(stem);
-            p += 2;
-        } else {
-            *out++ = *p++;
+    char *star_pos = (char*)strchr(pattern, '*');
+    if (!star_pos) {
+        *deps = malloc(sizeof(char*));
+        (*deps)[0] = strdup(pattern);
+        *dep_count = 1;
+        return;
+    }
+    
+    int prefix_len = star_pos - pattern;
+    int suffix_len = strlen(pattern) - (prefix_len + 1);
+    char suffix[MAX_LINE];
+    if (suffix_len > 0) {
+        strcpy(suffix, pattern + prefix_len + 1);
+    } else {
+        suffix[0] = '\0';
+    }
+    
+    DIR *dir = opendir(".");
+    if (!dir) return;
+    
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        
+        if (strncmp(entry->d_name, pattern, prefix_len) == 0) {
+            int name_len = strlen(entry->d_name);
+            if (suffix_len == 0 || (name_len >= suffix_len && 
+                strcmp(entry->d_name + name_len - suffix_len, suffix) == 0)) {
+                (*deps) = realloc(*deps, (*dep_count + 1) * sizeof(char*));
+                (*deps)[*dep_count] = strdup(entry->d_name);
+                (*dep_count)++;
+            }
         }
     }
-    *out = '\0';
     
-    strcpy(result, dep_result);
-    free(dep_result);
+    closedir(dir);
+}
+
+int needs_rebuild(const char *target, char **deps, int dep_count) {
+    time_t target_time = get_mtime(target);
+    
+    if (target_time == 0) return 1;
+    
+    for (int i = 0; i < dep_count; i++) {
+        time_t dep_time = get_mtime(deps[i]);
+        if (dep_time > target_time) return 1;
+    }
+    
+    return 0;
+}
+
+char **split_deps(const char *dep_str, int *count) {
+    char *copy = strdup(dep_str);
+    char **result = NULL;
+    *count = 0;
+    
+    char *token = strtok(copy, " ");
+    while (token) {
+        result = realloc(result, (*count + 1) * sizeof(char*));
+        result[*count] = strdup(token);
+        (*count)++;
+        token = strtok(NULL, " ");
+    }
+    
+    free(copy);
     return result;
 }
 
@@ -420,9 +489,11 @@ void free_expr(ExprNode *node) {
     free(node);
 }
 
-char *expand_string(const char *str) {
+char *expand_string(const char *str, int for_dependency) {
     static char result[MAX_LINE];
     result[0] = '\0';
+    
+    (void)for_dependency;  // подавляем warning о неиспользуемом параметре
     
     const char *p = str;
     while (*p) {
@@ -452,7 +523,7 @@ char *expand_string(const char *str) {
 
 int evaluate_condition(const char *expr) {
     char expanded[MAX_LINE];
-    strcpy(expanded, expand_string(expr));
+    strcpy(expanded, expand_string(expr, 0));
     trim(expanded);
     
     char *eq = strchr(expanded, '=');
@@ -475,6 +546,8 @@ void add_command(const char *name) {
     new_cmd->main_cmd_count = 0;
     new_cmd->flags = NULL;
     new_cmd->next = commands;
+    new_cmd->is_phony = 0;
+    new_cmd->last_build = 0;
     commands = new_cmd;
 }
 
@@ -488,7 +561,7 @@ Command *find_command(const char *name) {
 }
 
 void add_main_command(Command *cmd, const char *line) {
-    char *expanded = expand_string(line);
+    char *expanded = expand_string(line, 0);
     
     cmd->main_commands = realloc(cmd->main_commands, 
                                    (cmd->main_cmd_count + 1) * sizeof(char*));
@@ -521,7 +594,7 @@ void add_flag(Command *cmd, const char *flag_line) {
 }
 
 void add_flag_command(Flag *flag, const char *line) {
-    char *expanded = expand_string(line);
+    char *expanded = expand_string(line, 0);
     
     flag->commands = realloc(flag->commands, 
                               (flag->cmd_count + 1) * sizeof(char*));
@@ -594,7 +667,7 @@ void parse_umkfile(const char *filename) {
             char *var_value = eq + 1;
             trim(var_name);
             trim(var_value);
-            add_variable(var_name, expand_string(var_value));
+            add_variable(var_name, expand_string(var_value, 0));
             continue;
         }
         
@@ -608,7 +681,7 @@ void parse_umkfile(const char *filename) {
             
             if (fgets(line, sizeof(line), fp)) {
                 trim(line);
-                if (line[0] == '\t') {
+                if (line[0] == '\t' || line[0] == ' ') {
                     add_pattern_rule(target, dep, line + 1);
                 }
             }
@@ -616,6 +689,9 @@ void parse_umkfile(const char *filename) {
         }
         
         if (strcmp(line, "eoc") == 0) {
+            if (current_cmd) {
+                current_cmd->is_phony = 1;
+            }
             current_cmd = NULL;
             in_flags_block = 0;
             in_flag = 0;
@@ -747,26 +823,25 @@ void clear_jobs(void) {
     job_queue = NULL;
 }
 
-int execute_single_command(const char *cmd, int *job_id) {
-    static int next_job = 0;
-    *job_id = next_job++;
-    
-    if (jobs > 1) {
-        add_job(cmd);
-        return 0;
-    } else {
-        int ret = system(cmd);
-        if (ret != 0) {
-            char msg[MAX_LINE];
-            snprintf(msg, sizeof(msg), "Error: %s", cmd);
-            print_color(COLOR_RED, msg);
-            return ret;
-        }
+int execute_single_command(const char *cmd) {
+    if (dry_run) {
+        printf("%s\n", cmd);
         return 0;
     }
+    
+    int ret = system(cmd);
+    if (ret != 0) {
+        char msg[MAX_LINE];
+        snprintf(msg, sizeof(msg), "Error: %s", cmd);
+        print_color(COLOR_RED, msg);
+        return ret;
+    }
+    return 0;
 }
 
-int execute_commands(char **cmds, int cmd_count) {
+int execute_commands(char **cmds, int cmd_count, int check_timestamp) {
+    (void)check_timestamp;  // подавляем warning о неиспользуемом параметре
+    
     if (jobs > 1) {
         for (int i = 0; i < cmd_count; i++) {
             add_job(cmds[i]);
@@ -776,24 +851,68 @@ int execute_commands(char **cmds, int cmd_count) {
         return 0;
     } else {
         for (int i = 0; i < cmd_count; i++) {
-            int ret = system(cmds[i]);
-            if (ret != 0) {
-                char msg[MAX_LINE];
-                snprintf(msg, sizeof(msg), "Error: %s", cmds[i]);
-                print_color(COLOR_RED, msg);
-                return ret;
-            }
+            int ret = execute_single_command(cmds[i]);
+            if (ret != 0) return ret;
         }
         return 0;
     }
 }
 
 int execute_flag(Flag *flag) {
-    return execute_commands(flag->commands, flag->cmd_count);
+    return execute_commands(flag->commands, flag->cmd_count, 0);
 }
 
-int execute_main_commands(Command *cmd) {
-    return execute_commands(cmd->main_commands, cmd->main_cmd_count);
+int execute_pattern_rule(const char *target, PatternRule *rule) {
+    char *stem = apply_pattern(target, rule->target_pattern);
+    if (!stem) return 0;
+    
+    char dep_pattern[MAX_LINE];
+    strcpy(dep_pattern, rule->dep_pattern);
+    
+    char *dep_result = malloc(MAX_LINE);
+    char *p = dep_pattern;
+    char *out = dep_result;
+    while (*p) {
+        if (*p == '*' && (p == dep_pattern || *(p-1) != '$')) {
+            strcpy(out, stem);
+            out += strlen(stem);
+            p++;
+        } else if (*p == '$' && *(p+1) == '*') {
+            strcpy(out, stem);
+            out += strlen(stem);
+            p += 2;
+        } else {
+            *out++ = *p++;
+        }
+    }
+    *out = '\0';
+    
+    int dep_count;
+    char **deps = split_deps(dep_result, &dep_count);
+    
+    if (!needs_rebuild(target, deps, dep_count) && !dry_run) {
+        for (int i = 0; i < dep_count; i++) free(deps[i]);
+        free(deps);
+        free(dep_result);
+        return 0;
+    }
+    
+    set_special_vars(target, dep_count > 0 ? deps[0] : "", dep_result);
+    
+    int ret = 0;
+    for (int i = 0; i < rule->cmd_count; i++) {
+        char *expanded = expand_string(rule->commands[i], 0);
+        if (execute_single_command(expanded) != 0) {
+            ret = 1;
+            break;
+        }
+    }
+    
+    for (int i = 0; i < dep_count; i++) free(deps[i]);
+    free(deps);
+    free(dep_result);
+    
+    return ret;
 }
 
 int execute_command(const char *cmd_name, int flag_count, char **flags) {
@@ -850,8 +969,23 @@ int execute_command(const char *cmd_name, int flag_count, char **flags) {
         current = current->next;
     }
     
-    int ret = execute_main_commands(cmd);
-    if (ret != 0) return ret;
+    int ret = 0;
+    int need_build = 1;
+    
+    if (!cmd->is_phony && cmd->main_cmd_count > 0) {
+        need_build = 0;
+        for (int i = 0; i < cmd->main_cmd_count; i++) {
+            if (cmd->main_commands[i][0] != '\0') {
+                need_build = 1;
+                break;
+            }
+        }
+    }
+    
+    if (need_build) {
+        ret = execute_commands(cmd->main_commands, cmd->main_cmd_count, 1);
+        if (ret != 0) return ret;
+    }
     
     current = cmd->flags;
     while (current) {
@@ -863,6 +997,16 @@ int execute_command(const char *cmd_name, int flag_count, char **flags) {
             }
         }
         current = current->next;
+    }
+    
+    PatternRule *rule = pattern_rules;
+    while (rule) {
+        if (match_pattern(cmd_name, rule->target_pattern)) {
+            if (execute_pattern_rule(cmd_name, rule) != 0) {
+                return 1;
+            }
+        }
+        rule = rule->next;
     }
     
     return 0;
@@ -929,6 +1073,8 @@ int main(int argc, char **argv) {
             if (jobs < 1) jobs = 1;
         } else if (strcmp(argv[i], "--no-color") == 0) {
             use_color = 0;
+        } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) {
+            dry_run = 1;
         }
     }
     
@@ -937,7 +1083,8 @@ int main(int argc, char **argv) {
     int flag_count = 0;
     char **flags = malloc((argc - 2) * sizeof(char*));
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-j") == 0 || strcmp(argv[i], "--no-color") == 0) {
+        if (strcmp(argv[i], "-j") == 0 || strcmp(argv[i], "--no-color") == 0 ||
+            strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) {
             if (strcmp(argv[i], "-j") == 0) i++;
             continue;
         }
