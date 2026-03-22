@@ -17,12 +17,13 @@ A lightweight build system with clean syntax, designed as a simpler alternative 
 - Timestamp checking — rebuilds only when files change
 - Colored output
 - Dry-run mode — `-n`
+- Supports complex projects with multiple directories
 
 ## Quick Start
 
 Create a `UMK` file in your project:
 
-```
+++==++
 # Variables
 CC = gcc
 CFLAGS = -Wall -Wextra
@@ -53,58 +54,58 @@ eoc
 clean:
     rm -f *.o app
 eoc
-```
+++==++
 
 Run:
 
-```
+++==++
 umk build          # build the project
 umk build --clean  # clean and rebuild
 umk build -j 4     # parallel build
 umk clean          # clean generated files
 umk -n build       # dry-run
-```
+++==++
 
 ## Installation
 
 ### From source
 
-```
+++==++
 git clone https://github.com/USER12mSD4C/umk
 cd umk
 make
 sudo make install
-```
+++==++
 
 ### From AUR (Arch Linux)
 
-```
+++==++
 yay -S umk
 # or
 paru -S umk
-```
+++==++
 
 ### Manual
 
-```
+++==++
 gcc -O2 -Wall -Wextra -o umk umk.c
 sudo cp umk /usr/local/bin/
-```
+++==++
 
 ## Syntax Reference
 
 ### Variables
 
-```
+++==++
 CC = gcc
 CFLAGS = -Wall
 SRCS = $(wildcard *.c)
 OBJS = $(SRCS:.c=.o)
-```
+++==++
 
 ### Pattern Rules
 
-```
+++==++
 # Basic
 %.o: %.c
     $(CC) $(CFLAGS) -c -o $@ $<
@@ -114,21 +115,26 @@ eoc
 kernel/%.o: kernel/%.c
     $(CC) $(CFLAGS) -c -o $@ $<
 eoc
-```
+
+# Multiple directories
+drivers/%.o: drivers/%.c
+    $(CC) $(CFLAGS) -c -o $@ $<
+eoc
+++==++
 
 ### Conditionals
 
-```
+++==++
 if $(DEBUG) == 1
     CFLAGS = -g -O0
 else
     CFLAGS = -O2
 endif
-```
+++==++
 
 ### Commands with Flags
 
-```
+++==++
 build:
     echo "Building..."
     +flags:
@@ -140,23 +146,23 @@ build:
         eofg
     ;
 eoc
-```
+++==++
 
 Run with flags:
 
-```
+++==++
 umk build --preclean --postclean
-```
+++==++
 
 ### Calling Targets
 
-```
+++==++
 build:
-    call app
-    call tests
+    call kernel.bin
+    call kom
     echo "All done"
 eoc
-```
+++==++
 
 ### Special Variables
 
@@ -183,7 +189,7 @@ eoc
 
 ## Example: Full C Project
 
-```
+++==++
 CC = gcc
 CFLAGS = -Wall -Wextra -O2
 
@@ -206,7 +212,54 @@ eoc
 clean:
     rm -f *.o app
 eoc
-```
+++==++
+
+## Example: Operating System Project
+
+++==++
+AS = nasm
+CC = gcc
+LD = ld
+
+ASFLAGS = -f elf64
+CFLAGS = -m64 -ffreestanding -nostdlib -Iinclude
+LDFLAGS = -m elf_x86_64 -T linker.ld -nostdlib
+
+# Pattern rules for each directory
+kernel/%.o: kernel/%.c
+    $(CC) $(CFLAGS) -c -o $@ $<
+eoc
+
+drivers/%.o: drivers/%.c
+    $(CC) $(CFLAGS) -c -o $@ $<
+eoc
+
+# Assembly files
+kernel/entry.o: kernel/entry.asm
+    $(AS) $(ASFLAGS) -o $@ $<
+eoc
+
+# Main kernel
+kernel.bin: kernel/entry.o kernel/kernel.o drivers/vga.o
+    $(LD) $(LDFLAGS) -o kernel.bin $^
+eoc
+
+# Build commands
+build:
+    call kernel.bin
+    echo "=== BUILD COMPLETE ==="
+    +flags:
+        -fg(clean):
+            call clean
+            call kernel.bin
+        eofg
+    ;
+eoc
+
+clean:
+    rm -rf *.o */*.o *.bin
+eoc
+++==++
 
 ## License
 
