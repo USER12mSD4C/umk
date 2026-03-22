@@ -1,4 +1,4 @@
-// umk.c - с проверкой времени файлов
+// umk.c - с поддержкой call
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +95,7 @@ void add_pattern_rule(const char *target, const char *dep, const char *cmd);
 void parse_umkfile(const char *filename);
 int evaluate_condition(const char *expr);
 int execute_command(const char *cmd_name, int flag_count, char **flags);
+int execute_target(const char *target_name);
 int execute_commands(char **cmds, int cmd_count);
 int execute_single_command(const char *cmd);
 int execute_flag(Flag *flag);
@@ -138,20 +139,12 @@ time_t get_mtime(const char *path) {
 
 int needs_rebuild(const char *target, char **deps, int dep_count) {
     time_t target_time = get_mtime(target);
-    
-    // Если целевого файла нет — нужно собрать
     if (target_time == 0) return 1;
-    
-    // Проверяем зависимости
     for (int i = 0; i < dep_count; i++) {
         time_t dep_time = get_mtime(deps[i]);
-        if (dep_time == 0) {
-            // Зависимости нет — считаем что нужно собрать
-            return 1;
-        }
+        if (dep_time == 0) return 1;
         if (dep_time > target_time) return 1;
     }
-    
     return 0;
 }
 
@@ -579,7 +572,6 @@ void parse_umkfile(const char *filename) {
                 *colon = '\0';
                 add_command(line);
                 current_cmd = commands;
-                // Парсим зависимости после двоеточия
                 char *deps_str = colon + 1;
                 trim(deps_str);
                 if (strlen(deps_str) > 0) {
@@ -741,10 +733,30 @@ int execute_pattern_rule(const char *target, PatternRule *rule) {
     return ret;
 }
 
+// Выполнение цели по имени
+int execute_target(const char *target_name) {
+    Command *cmd = find_command(target_name);
+    if (cmd) {
+        return execute_command(target_name, 0, NULL);
+    }
+    
+    PatternRule *rule = pattern_rules;
+    while (rule) {
+        if (match_pattern(target_name, rule->target_pattern)) {
+            return execute_pattern_rule(target_name, rule);
+        }
+        rule = rule->next;
+    }
+    
+    char msg[MAX_LINE];
+    snprintf(msg, sizeof(msg), "Unknown target: %s", target_name);
+    print_color(COLOR_RED, msg);
+    return 1;
+}
+
 int execute_command(const char *cmd_name, int flag_count, char **flags) {
     Command *cmd = find_command(cmd_name);
     if (!cmd) {
-        // Проверяем паттерн-правила
         PatternRule *rule = pattern_rules;
         while (rule) {
             if (match_pattern(cmd_name, rule->target_pattern)) {
@@ -787,15 +799,6 @@ int execute_command(const char *cmd_name, int flag_count, char **flags) {
         }
     }
     
-    // Проверяем нужно ли пересобирать
-    int need_build = 1;
-    if (!cmd->is_phony && cmd->dep_count > 0) {
-        need_build = needs_rebuild(cmd_name, cmd->deps, cmd->dep_count);
-        if (!need_build && !dry_run) {
-            if (!dry_run) return 0;
-        }
-    }
-    
     // BEFORE flags
     for (int i = 0; i < requested_count; i++) {
         if (requested_flags[i]->type == 0) {
@@ -804,10 +807,18 @@ int execute_command(const char *cmd_name, int flag_count, char **flags) {
         }
     }
     
-    // Main commands (только если нужно пересобирать)
-    if (need_build) {
-        for (int i = 0; i < cmd->main_cmd_count; i++) {
-            char *expanded = expand_string(cmd->main_commands[i]);
+    // Main commands - проверяем на "call"
+    for (int i = 0; i < cmd->main_cmd_count; i++) {
+        char *line = cmd->main_commands[i];
+        char *expanded = expand_string(line);
+        
+        // Проверяем, начинается ли строка с "call "
+        if (strncmp(expanded, "call ", 5) == 0) {
+            char *target = expanded + 5;
+            trim(target);
+            int ret = execute_target(target);
+            if (ret != 0) return ret;
+        } else {
             int ret = execute_single_command(expanded);
             if (ret != 0) return ret;
         }
