@@ -4,25 +4,25 @@ A lightweight build system with clean syntax, designed as a simpler alternative 
 
 ## Features
 
-- **Simple syntax** - clean and readable
-- **Variables** - `CC = gcc`, `CFLAGS = -Wall`
-- **Pattern rules** - `%.o: %.c` with paths (`kernel/%.o: kernel/%.c`)
-- **Automatic wildcard** - `$(wildcard *.c)` finds all source files
-- **Conditionals** - `if $(DEBUG) == 1` / `else` / `endif`
-- **Built-in functions** - `$(shell date)`, `$(wildcard *.c)`
-- **Special variables** - `$@` (target), `$<` (first dependency), `$^` (all dependencies)
-- **Parallel execution** - `-j N` for faster builds
-- **Command flags** - `-fg(name)` (before main command), `+fg(name)` (after main command)
-- **Call targets** - `call target` to invoke other build rules
-- **Timestamp checking** - rebuilds only when files change
-- **Colored output** - errors in red
-- **Dry-run mode** - `-n` shows what would be executed
+- Simple syntax — clean and readable
+- Variables — `CC = gcc`, `CFLAGS = -Wall`
+- Pattern rules — `%.o: %.c` with paths (`kernel/%.o: kernel/%.c`)
+- Automatic wildcard — `$(wildcard *.c)` finds all source files
+- Conditionals — `if $(DEBUG) == 1` / `else` / `endif`
+- Built-in functions — `$(shell date)`, `$(wildcard *.c)`
+- Special variables — `$@` (target), `$<` (first dep), `$^` (all deps)
+- Parallel execution — `-j N`
+- Command flags — `-fg(name)` (before), `+fg(name)` (after)
+- Call targets — `call target` to invoke other rules
+- Timestamp checking — rebuilds only when files change
+- Colored output
+- Dry-run mode — `-n`
 
 ## Quick Start
 
 Create a `UMK` file in your project:
 
-```umk
+```
 # Variables
 CC = gcc
 CFLAGS = -Wall -Wextra
@@ -53,3 +53,161 @@ eoc
 clean:
     rm -f *.o app
 eoc
+```
+
+Run:
+
+```
+umk build          # build the project
+umk build --clean  # clean and rebuild
+umk build -j 4     # parallel build
+umk clean          # clean generated files
+umk -n build       # dry-run
+```
+
+## Installation
+
+### From source
+
+```
+git clone https://github.com/USER12mSD4C/umk
+cd umk
+make
+sudo make install
+```
+
+### From AUR (Arch Linux)
+
+```
+yay -S umk
+# or
+paru -S umk
+```
+
+### Manual
+
+```
+gcc -O2 -Wall -Wextra -o umk umk.c
+sudo cp umk /usr/local/bin/
+```
+
+## Syntax Reference
+
+### Variables
+
+```
+CC = gcc
+CFLAGS = -Wall
+SRCS = $(wildcard *.c)
+OBJS = $(SRCS:.c=.o)
+```
+
+### Pattern Rules
+
+```
+# Basic
+%.o: %.c
+    $(CC) $(CFLAGS) -c -o $@ $<
+eoc
+
+# With directory
+kernel/%.o: kernel/%.c
+    $(CC) $(CFLAGS) -c -o $@ $<
+eoc
+```
+
+### Conditionals
+
+```
+if $(DEBUG) == 1
+    CFLAGS = -g -O0
+else
+    CFLAGS = -O2
+endif
+```
+
+### Commands with Flags
+
+```
+build:
+    echo "Building..."
+    +flags:
+        -fg(preclean):
+            echo "Pre-build cleanup"
+        eofg
+        +fg(postclean):
+            echo "Post-build cleanup"
+        eofg
+    ;
+eoc
+```
+
+Run with flags:
+
+```
+umk build --preclean --postclean
+```
+
+### Calling Targets
+
+```
+build:
+    call app
+    call tests
+    echo "All done"
+eoc
+```
+
+### Special Variables
+
+| Variable | Meaning |
+|----------|---------|
+| `$@` | Target name |
+| `$<` | First dependency |
+| `$^` | All dependencies |
+
+### Built-in Functions
+
+| Function | Description |
+|----------|-------------|
+| `$(wildcard pattern)` | List files matching pattern |
+| `$(shell command)` | Execute command and return output |
+
+## Command Line Options
+
+| Option | Description |
+|--------|-------------|
+| `-j N` | Run N jobs in parallel |
+| `-n, --dry-run` | Show commands without executing |
+| `--no-color` | Disable colored output |
+
+## Example: Full C Project
+
+```
+CC = gcc
+CFLAGS = -Wall -Wextra -O2
+
+SRCS = $(wildcard *.c)
+OBJS = $(SRCS:.c=.o)
+
+%.o: %.c
+    $(CC) $(CFLAGS) -c -o $@ $<
+eoc
+
+app: $(OBJS)
+    $(CC) -o $@ $^
+eoc
+
+build:
+    call app
+    echo "=== BUILD SUCCESS ==="
+eoc
+
+clean:
+    rm -f *.o app
+eoc
+```
+
+## License
+
+MIT
