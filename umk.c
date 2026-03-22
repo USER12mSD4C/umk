@@ -1,4 +1,4 @@
-// umk.c - полная исправленная версия
+// umk.c - с проверкой времени файлов
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +52,8 @@ typedef struct Command {
     Flag *flags;
     struct Command *next;
     int is_phony;
+    char **deps;
+    int dep_count;
 } Command;
 
 typedef struct Variable {
@@ -86,6 +88,7 @@ char *get_variable(const char *name);
 void set_special_vars(const char *target, const char *dep, const char *all_deps);
 void add_command(const char *name);
 void add_main_command(Command *cmd, const char *line);
+void add_dependencies(Command *cmd, const char *dep_str);
 void add_flag(Command *cmd, const char *flag_line);
 void add_flag_command(Flag *flag, const char *line);
 void add_pattern_rule(const char *target, const char *dep, const char *cmd);
@@ -95,6 +98,9 @@ int execute_command(const char *cmd_name, int flag_count, char **flags);
 int execute_commands(char **cmds, int cmd_count);
 int execute_single_command(const char *cmd);
 int execute_flag(Flag *flag);
+int execute_pattern_rule(const char *target, PatternRule *rule);
+int needs_rebuild(const char *target, char **deps, int dep_count);
+time_t get_mtime(const char *path);
 int match_pattern(const char *name, const char *pattern);
 char *apply_pattern(const char *target, const char *pattern);
 char **split_deps(const char *dep_str, int *count);
@@ -121,6 +127,33 @@ BuiltinFunc builtins[] = {
 };
 
 // ==== Реализация ====
+
+time_t get_mtime(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return st.st_mtime;
+    }
+    return 0;
+}
+
+int needs_rebuild(const char *target, char **deps, int dep_count) {
+    time_t target_time = get_mtime(target);
+    
+    // Если целевого файла нет — нужно собрать
+    if (target_time == 0) return 1;
+    
+    // Проверяем зависимости
+    for (int i = 0; i < dep_count; i++) {
+        time_t dep_time = get_mtime(deps[i]);
+        if (dep_time == 0) {
+            // Зависимости нет — считаем что нужно собрать
+            return 1;
+        }
+        if (dep_time > target_time) return 1;
+    }
+    
+    return 0;
+}
 
 void trim(char *str) {
     char *start = str;
@@ -423,6 +456,8 @@ void add_command(const char *name) {
     new_cmd->flags = NULL;
     new_cmd->next = commands;
     new_cmd->is_phony = 0;
+    new_cmd->deps = NULL;
+    new_cmd->dep_count = 0;
     commands = new_cmd;
 }
 
@@ -439,6 +474,11 @@ void add_main_command(Command *cmd, const char *line) {
     cmd->main_commands = realloc(cmd->main_commands, (cmd->main_cmd_count + 1) * sizeof(char*));
     cmd->main_commands[cmd->main_cmd_count] = strdup(line);
     cmd->main_cmd_count++;
+}
+
+void add_dependencies(Command *cmd, const char *dep_str) {
+    char *expanded = expand_string(dep_str);
+    cmd->deps = split_deps(expanded, &cmd->dep_count);
 }
 
 void add_flag(Command *cmd, const char *flag_line) {
@@ -535,7 +575,18 @@ void parse_umkfile(const char *filename) {
         if (colon && !in_flags_block && strcmp(line, "+flags:") != 0) {
             int in_quotes = 0, is_command = 1;
             for (char *p = line; p < colon; p++) { if (*p == '"') in_quotes = !in_quotes; if (in_quotes) { is_command = 0; break; } }
-            if (is_command) { *colon = '\0'; add_command(line); current_cmd = commands; continue; }
+            if (is_command) {
+                *colon = '\0';
+                add_command(line);
+                current_cmd = commands;
+                // Парсим зависимости после двоеточия
+                char *deps_str = colon + 1;
+                trim(deps_str);
+                if (strlen(deps_str) > 0) {
+                    add_dependencies(current_cmd, deps_str);
+                }
+                continue;
+            }
         }
         
         if (!current_cmd) continue;
@@ -638,9 +689,70 @@ int execute_flag(Flag *flag) {
     return 0;
 }
 
+int execute_pattern_rule(const char *target, PatternRule *rule) {
+    char *stem = apply_pattern(target, rule->target_pattern);
+    if (!stem) return 0;
+    
+    char dep_pattern[MAX_LINE];
+    strcpy(dep_pattern, rule->dep_pattern);
+    
+    char *dep_result = malloc(MAX_LINE);
+    char *p = dep_pattern, *out = dep_result;
+    while (*p) {
+        if (*p == '*' && (p == dep_pattern || *(p-1) != '$')) {
+            strcpy(out, stem);
+            out += strlen(stem);
+            p++;
+        } else if (*p == '$' && *(p+1) == '*') {
+            strcpy(out, stem);
+            out += strlen(stem);
+            p += 2;
+        } else {
+            *out++ = *p++;
+        }
+    }
+    *out = '\0';
+    
+    int dep_count;
+    char **deps = split_deps(dep_result, &dep_count);
+    
+    if (!needs_rebuild(target, deps, dep_count) && !dry_run) {
+        for (int i = 0; i < dep_count; i++) free(deps[i]);
+        free(deps);
+        free(dep_result);
+        return 0;
+    }
+    
+    set_special_vars(target, dep_count > 0 ? deps[0] : "", dep_result);
+    
+    int ret = 0;
+    for (int i = 0; i < rule->cmd_count; i++) {
+        char *expanded = expand_string_with_special(rule->commands[i], target, 
+                                                     dep_count > 0 ? deps[0] : "", dep_result);
+        if (execute_single_command(expanded) != 0) {
+            ret = 1;
+            break;
+        }
+    }
+    
+    for (int i = 0; i < dep_count; i++) free(deps[i]);
+    free(deps);
+    free(dep_result);
+    return ret;
+}
+
 int execute_command(const char *cmd_name, int flag_count, char **flags) {
     Command *cmd = find_command(cmd_name);
     if (!cmd) {
+        // Проверяем паттерн-правила
+        PatternRule *rule = pattern_rules;
+        while (rule) {
+            if (match_pattern(cmd_name, rule->target_pattern)) {
+                return execute_pattern_rule(cmd_name, rule);
+            }
+            rule = rule->next;
+        }
+        
         char msg[MAX_LINE];
         snprintf(msg, sizeof(msg), "Unknown command: %s", cmd_name);
         print_color(COLOR_RED, msg);
@@ -675,6 +787,15 @@ int execute_command(const char *cmd_name, int flag_count, char **flags) {
         }
     }
     
+    // Проверяем нужно ли пересобирать
+    int need_build = 1;
+    if (!cmd->is_phony && cmd->dep_count > 0) {
+        need_build = needs_rebuild(cmd_name, cmd->deps, cmd->dep_count);
+        if (!need_build && !dry_run) {
+            if (!dry_run) return 0;
+        }
+    }
+    
     // BEFORE flags
     for (int i = 0; i < requested_count; i++) {
         if (requested_flags[i]->type == 0) {
@@ -683,11 +804,13 @@ int execute_command(const char *cmd_name, int flag_count, char **flags) {
         }
     }
     
-    // Main commands
-    for (int i = 0; i < cmd->main_cmd_count; i++) {
-        char *expanded = expand_string(cmd->main_commands[i]);
-        int ret = execute_single_command(expanded);
-        if (ret != 0) return ret;
+    // Main commands (только если нужно пересобирать)
+    if (need_build) {
+        for (int i = 0; i < cmd->main_cmd_count; i++) {
+            char *expanded = expand_string(cmd->main_commands[i]);
+            int ret = execute_single_command(expanded);
+            if (ret != 0) return ret;
+        }
     }
     
     // AFTER flags
@@ -707,6 +830,8 @@ void free_commands() {
         Command *next = cmd->next;
         for (int i = 0; i < cmd->main_cmd_count; i++) free(cmd->main_commands[i]);
         free(cmd->main_commands);
+        for (int i = 0; i < cmd->dep_count; i++) free(cmd->deps[i]);
+        free(cmd->deps);
         Flag *flag = cmd->flags;
         while (flag) {
             Flag *next_flag = flag->next;
