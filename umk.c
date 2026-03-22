@@ -1,4 +1,4 @@
-// umk.c - полная версия с поддержкой путей в паттерн-правилах
+// umk.c - полноценная замена make
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +13,7 @@
 #define MAX_LINE 4096
 #define MAX_NAME 256
 #define MAX_JOBS 64
+#define MAX_FILES 1024
 
 #define COLOR_RED     "\033[31m"
 #define COLOR_GREEN   "\033[32m"
@@ -54,6 +55,7 @@ typedef struct Command {
     int is_phony;
     char **deps;
     int dep_count;
+    int is_rule;
 } Command;
 
 typedef struct Variable {
@@ -82,11 +84,10 @@ void trim(char *str);
 int is_blank(const char *str);
 char *expand_string(const char *str);
 char *expand_string_with_special(const char *str, const char *target, const char *dep, const char *all_deps);
-char *eval_expr_str(const char *str);
 void add_variable(const char *name, const char *value);
 char *get_variable(const char *name);
 void set_special_vars(const char *target, const char *dep, const char *all_deps);
-void add_command(const char *name);
+void add_command(const char *name, int is_rule);
 void add_main_command(Command *cmd, const char *line);
 void add_dependencies(Command *cmd, const char *dep_str);
 void add_flag(Command *cmd, const char *flag_line);
@@ -94,7 +95,6 @@ void add_flag_command(Flag *flag, const char *line);
 void add_pattern_rule(const char *target, const char *dep, const char *cmd);
 void parse_umkfile(const char *filename);
 int evaluate_condition(const char *expr);
-int execute_command(const char *cmd_name, int flag_count, char **flags);
 int execute_target(const char *target_name);
 int execute_commands(char **cmds, int cmd_count);
 int execute_single_command(const char *cmd);
@@ -113,6 +113,8 @@ char *wildcard(const char *pattern);
 char *shell(const char *cmd);
 void print_color(const char *color, const char *msg);
 PatternRule *find_pattern_rule(const char *target);
+char **expand_variable_list(const char *var_name, int *count);
+void collect_source_files(const char *dir, char ***files, int *count);
 
 // Встроенные функции
 typedef struct {
@@ -133,9 +135,7 @@ BuiltinFunc builtins[] = {
 
 time_t get_mtime(const char *path) {
     struct stat st;
-    if (stat(path, &st) == 0) {
-        return st.st_mtime;
-    }
+    if (stat(path, &st) == 0) return st.st_mtime;
     return 0;
 }
 
@@ -200,14 +200,10 @@ char *get_variable(const char *name) {
     return NULL;
 }
 
-static char current_target[MAX_NAME];
-static char current_dep[MAX_NAME];
-static char current_deps[MAX_LINE];
-
 void set_special_vars(const char *target, const char *dep, const char *all_deps) {
-    if (target) { strcpy(current_target, target); add_variable("@", target); }
-    if (dep) { strcpy(current_dep, dep); add_variable("<", dep); }
-    if (all_deps) { strcpy(current_deps, all_deps); add_variable("^", all_deps); }
+    if (target) add_variable("@", target);
+    if (dep) add_variable("<", dep);
+    if (all_deps) add_variable("^", all_deps);
 }
 
 int match_pattern(const char *name, const char *pattern) {
@@ -322,7 +318,7 @@ char *func_shell(const char **args, int arg_count) {
     return arg_count > 0 ? shell(args[0]) : "";
 }
 
-char *eval_expr_str(const char *str) {
+char *expand_string(const char *str) {
     static char result[MAX_LINE];
     result[0] = '\0';
     
@@ -374,12 +370,6 @@ char *eval_expr_str(const char *str) {
             p++;
         }
     }
-    return result;
-}
-
-char *expand_string(const char *str) {
-    static char result[MAX_LINE];
-    strcpy(result, eval_expr_str(str));
     return result;
 }
 
@@ -464,16 +454,17 @@ int evaluate_condition(const char *expr) {
     return strlen(expanded) > 0 && strcmp(expanded, "0") != 0;
 }
 
-void add_command(const char *name) {
+void add_command(const char *name, int is_rule) {
     Command *new_cmd = malloc(sizeof(Command));
     strcpy(new_cmd->name, name);
     new_cmd->main_commands = NULL;
     new_cmd->main_cmd_count = 0;
     new_cmd->flags = NULL;
     new_cmd->next = commands;
-    new_cmd->is_phony = 0;
+    new_cmd->is_phony = !is_rule;
     new_cmd->deps = NULL;
     new_cmd->dep_count = 0;
+    new_cmd->is_rule = is_rule;
     commands = new_cmd;
 }
 
@@ -538,9 +529,7 @@ void add_pattern_rule(const char *target, const char *dep, const char *cmd) {
 PatternRule *find_pattern_rule(const char *target) {
     PatternRule *rule = pattern_rules;
     while (rule) {
-        if (match_pattern(target, rule->target_pattern)) {
-            return rule;
-        }
+        if (match_pattern(target, rule->target_pattern)) return rule;
         rule = rule->next;
     }
     return NULL;
@@ -606,7 +595,7 @@ void parse_umkfile(const char *filename) {
             for (char *p = line; p < colon; p++) { if (*p == '"') in_quotes = !in_quotes; if (in_quotes) { is_command = 0; break; } }
             if (is_command) {
                 *colon = '\0';
-                add_command(line);
+                add_command(line, 1);
                 current_cmd = commands;
                 char *deps_str = colon + 1;
                 trim(deps_str);
@@ -718,7 +707,15 @@ int execute_flag(Flag *flag) {
 }
 
 int execute_pattern_rule(const char *target, PatternRule *rule) {
-    char *stem = apply_pattern(target, rule->target_pattern);
+    if (!target || strlen(target) == 0) return 0;
+    
+    char clean_target[MAX_LINE];
+    strcpy(clean_target, target);
+    trim(clean_target);
+    
+    if (strlen(clean_target) == 0) return 0;
+    
+    char *stem = apply_pattern(clean_target, rule->target_pattern);
     if (!stem) return 0;
     
     char *dep_pattern_expanded = expand_dep_pattern(rule->dep_pattern, stem);
@@ -726,12 +723,18 @@ int execute_pattern_rule(const char *target, PatternRule *rule) {
     int dep_count;
     char **deps = split_deps(dep_pattern_expanded, &dep_count);
     
-    // Сначала компилируем все зависимости
+    // Компилируем зависимости рекурсивно
     for (int i = 0; i < dep_count; i++) {
         PatternRule *dep_rule = find_pattern_rule(deps[i]);
         if (dep_rule) {
             int ret = execute_pattern_rule(deps[i], dep_rule);
             if (ret != 0) return ret;
+        } else {
+            Command *cmd = find_command(deps[i]);
+            if (cmd && cmd->is_rule) {
+                int ret = execute_target(deps[i]);
+                if (ret != 0) return ret;
+            }
         }
     }
     
@@ -759,39 +762,95 @@ int execute_pattern_rule(const char *target, PatternRule *rule) {
 }
 
 int execute_target(const char *target_name) {
-    Command *cmd = find_command(target_name);
+    // Очищаем от пробелов и проверяем
+    if (!target_name) return 0;
+    
+    char clean_target[MAX_LINE];
+    strcpy(clean_target, target_name);
+    trim(clean_target);
+    
+    if (strlen(clean_target) == 0) return 0;
+    
+    Command *cmd = find_command(clean_target);
     if (cmd) {
-        return execute_command(target_name, 0, NULL);
-    }
-    
-    PatternRule *rule = find_pattern_rule(target_name);
-    if (rule) {
-        return execute_pattern_rule(target_name, rule);
-    }
-    
-    // Если нет правила, но файл существует — ничего не делаем
-    if (get_mtime(target_name) != 0) {
+        // Выполняем команду/правило
+        if (cmd->is_rule && cmd->dep_count > 0) {
+            // Проверяем зависимости
+            int need_build = 1;
+            if (!cmd->is_phony) {
+                need_build = needs_rebuild(clean_target, cmd->deps, cmd->dep_count);
+            }
+            
+            if (!need_build && !dry_run) return 0;
+            
+            // Сначала выполняем зависимости
+            for (int i = 0; i < cmd->dep_count; i++) {
+                int ret = execute_target(cmd->deps[i]);
+                if (ret != 0) return ret;
+            }
+        }
+        
+        // Выполняем команды
+        for (int i = 0; i < cmd->main_cmd_count; i++) {
+            char *line = cmd->main_commands[i];
+            char *expanded = expand_string(line);
+            
+            // Очищаем от пробелов
+            char clean_line[MAX_LINE];
+            strcpy(clean_line, expanded);
+            trim(clean_line);
+            
+            if (strlen(clean_line) == 0) continue;
+            
+            // Если строка начинается с "call " — рекурсивный вызов
+            if (strncmp(clean_line, "call ", 5) == 0) {
+                char *target = clean_line + 5;
+                trim(target);
+                if (strlen(target) > 0) {
+                    int ret = execute_target(target);
+                    if (ret != 0) return ret;
+                }
+            } else {
+                int ret = execute_single_command(clean_line);
+                if (ret != 0) return ret;
+            }
+        }
         return 0;
     }
     
+    // Ищем паттерн-правило
+    PatternRule *rule = find_pattern_rule(clean_target);
+    if (rule) {
+        return execute_pattern_rule(clean_target, rule);
+    }
+    
+    // Если файл существует — ничего не делаем
+    if (get_mtime(clean_target) != 0) return 0;
+    
     char msg[MAX_LINE];
-    snprintf(msg, sizeof(msg), "Unknown target: %s", target_name);
+    snprintf(msg, sizeof(msg), "Unknown target: %s", clean_target);
     print_color(COLOR_RED, msg);
     return 1;
 }
 
 int execute_command(const char *cmd_name, int flag_count, char **flags) {
-    Command *cmd = find_command(cmd_name);
+    // Очищаем имя команды
+    if (!cmd_name) return 0;
+    
+    char clean_cmd[MAX_LINE];
+    strcpy(clean_cmd, cmd_name);
+    trim(clean_cmd);
+    
+    if (strlen(clean_cmd) == 0) return 0;
+    
+    Command *cmd = find_command(clean_cmd);
     if (!cmd) {
-        PatternRule *rule = find_pattern_rule(cmd_name);
-        if (rule) {
-            return execute_pattern_rule(cmd_name, rule);
-        }
-        
-        char msg[MAX_LINE];
-        snprintf(msg, sizeof(msg), "Unknown command: %s", cmd_name);
-        print_color(COLOR_RED, msg);
-        return 1;
+        return execute_target(clean_cmd);
+    }
+    
+    // Если это правило с зависимостями — обрабатываем как цель
+    if (cmd->is_rule && cmd->dep_count > 0) {
+        return execute_target(clean_cmd);
     }
     
     Flag *requested_flags[MAX_NAME];
@@ -830,18 +889,27 @@ int execute_command(const char *cmd_name, int flag_count, char **flags) {
         }
     }
     
-    // Main commands
+    // Выполняем команды
     for (int i = 0; i < cmd->main_cmd_count; i++) {
         char *line = cmd->main_commands[i];
         char *expanded = expand_string(line);
         
-        if (strncmp(expanded, "call ", 5) == 0) {
-            char *target = expanded + 5;
+        char clean_line[MAX_LINE];
+        strcpy(clean_line, expanded);
+        trim(clean_line);
+        
+        if (strlen(clean_line) == 0) continue;
+        
+        // Если строка начинается с "call " — вызов цели
+        if (strncmp(clean_line, "call ", 5) == 0) {
+            char *target = clean_line + 5;
             trim(target);
-            int ret = execute_target(target);
-            if (ret != 0) return ret;
+            if (strlen(target) > 0) {
+                int ret = execute_target(target);
+                if (ret != 0) return ret;
+            }
         } else {
-            int ret = execute_single_command(expanded);
+            int ret = execute_single_command(clean_line);
             if (ret != 0) return ret;
         }
     }

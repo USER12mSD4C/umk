@@ -1,50 +1,55 @@
 # umk - Simple Build System
 
-umk is a simple build system with clean syntax, variables, pattern rules, and parallel execution.
+A lightweight build system with clean syntax, designed as a simpler alternative to make for C/C++ projects.
 
 ## Features
 
-- Variables: `CC = gcc`, `CFLAGS = -Wall`
-- Pattern rules: `%.o: %.c`
-- Conditionals: `if $(DEBUG) == 1`
-- Built-in functions: `$(wildcard *.c)`, `$(shell date)`
-- Special variables: `$@`, `$<`, `$^`
-- Parallel execution: `-j N`
-- Command flags: `-fg(name)` (before), `+fg(name)` (after)
-- Colored output
+- **Simple syntax** - clean and readable
+- **Variables** - `CC = gcc`, `CFLAGS = -Wall`
+- **Pattern rules** - `%.o: %.c` with paths (`kernel/%.o: kernel/%.c`)
+- **Automatic wildcard** - `$(wildcard *.c)` finds all source files
+- **Conditionals** - `if $(DEBUG) == 1` / `else` / `endif`
+- **Built-in functions** - `$(shell date)`, `$(wildcard *.c)`
+- **Special variables** - `$@` (target), `$<` (first dependency), `$^` (all dependencies)
+- **Parallel execution** - `-j N` for faster builds
+- **Command flags** - `-fg(name)` (before main command), `+fg(name)` (after main command)
+- **Call targets** - `call target` to invoke other build rules
+- **Timestamp checking** - rebuilds only when files change
+- **Colored output** - errors in red
+- **Dry-run mode** - `-n` shows what would be executed
 
 ## Quick Start
 
-- Create `UMK` file:
+Create a `UMK` file in your project:
 
-```
-PREFIX ?= /usr/local
-BINDIR = $(PREFIX)/bin
+```umk
+# Variables
+CC = gcc
+CFLAGS = -Wall -Wextra
 
-umk: umk.c
-	gcc -O2 -Wall -Wextra -o umk umk.c
+# Pattern rule for C files
+%.o: %.c
+    $(CC) $(CFLAGS) -c -o $@ $<
+eoc
 
-install: umk
-	mkdir -p $(DESTDIR)$(BINDIR)
-	install -m755 umk $(DESTDIR)$(BINDIR)/
+# Main target
+app: main.o helper.o
+    $(CC) -o app $^
+eoc
 
-uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/umk
+# Build command
+build:
+    call app
+    echo "=== BUILD COMPLETE ==="
+    +flags:
+        -fg(clean):
+            call clean
+            call app
+        eofg
+    ;
+eoc
 
+# Clean command
 clean:
-	rm -f umk
-
-.PHONY: install uninstall clean
-```
-
-- Run:
-```
-umk build --preclean
-```
-## Installation:
-```
-git clone https://github.com/USER12mSD4C/umk
-cd umk
-make
-sudo make install
-```
+    rm -f *.o app
+eoc
