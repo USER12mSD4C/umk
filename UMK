@@ -1,0 +1,34 @@
+CC = gcc
+CFLAGS = -Wall
+
+# Шаблон для .o файлов
+%.o: %.c
+    $(CC) $(CFLAGS) -c $< -o $@
+
+# Условная компиляция
+if $(DEBUG) == 1
+    CFLAGS = -g -O0
+else
+    CFLAGS = -O2
+endif
+
+build:
+    echo "Building with $(CFLAGS)"
+    echo "Special vars test: target=$@"
+    +flags:
+        -fg(preclean):
+            echo "Preclean"
+        eofg
+        +fg(postclean):
+            echo "Postclean"
+        eofg
+    ;
+eoc
+
+clean:
+    echo "Cleaning"
+eoc
+
+test:
+    echo "Testing"
+eoc
