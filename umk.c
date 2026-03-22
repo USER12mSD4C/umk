@@ -1,4 +1,4 @@
-// umk.c - с поддержкой call
+// umk.c - полная версия с поддержкой путей в паттерн-правилах
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,6 +104,7 @@ int needs_rebuild(const char *target, char **deps, int dep_count);
 time_t get_mtime(const char *path);
 int match_pattern(const char *name, const char *pattern);
 char *apply_pattern(const char *target, const char *pattern);
+char *expand_dep_pattern(const char *pattern, const char *stem);
 char **split_deps(const char *dep_str, int *count);
 void run_jobs_parallel(void);
 void add_job(const char *cmd);
@@ -111,6 +112,7 @@ void clear_jobs(void);
 char *wildcard(const char *pattern);
 char *shell(const char *cmd);
 void print_color(const char *color, const char *msg);
+PatternRule *find_pattern_rule(const char *target);
 
 // Встроенные функции
 typedef struct {
@@ -242,6 +244,27 @@ char *apply_pattern(const char *target, const char *pattern) {
     int stem_len = target_len - prefix_len - suffix_len;
     strncpy(result, target + prefix_len, stem_len);
     result[stem_len] = '\0';
+    return result;
+}
+
+char *expand_dep_pattern(const char *pattern, const char *stem) {
+    static char result[MAX_LINE];
+    char *p = (char*)pattern;
+    char *out = result;
+    while (*p) {
+        if (*p == '*' && (p == pattern || *(p-1) != '$')) {
+            strcpy(out, stem);
+            out += strlen(stem);
+            p++;
+        } else if (*p == '$' && *(p+1) == '*') {
+            strcpy(out, stem);
+            out += strlen(stem);
+            p += 2;
+        } else {
+            *out++ = *p++;
+        }
+    }
+    *out = '\0';
     return result;
 }
 
@@ -512,6 +535,17 @@ void add_pattern_rule(const char *target, const char *dep, const char *cmd) {
     pattern_rules = rule;
 }
 
+PatternRule *find_pattern_rule(const char *target) {
+    PatternRule *rule = pattern_rules;
+    while (rule) {
+        if (match_pattern(target, rule->target_pattern)) {
+            return rule;
+        }
+        rule = rule->next;
+    }
+    return NULL;
+}
+
 void parse_umkfile(const char *filename) {
     FILE *fp = fopen(filename, "r");
     if (!fp) { print_color(COLOR_RED, "No UMK file found"); exit(1); }
@@ -557,7 +591,9 @@ void parse_umkfile(const char *filename) {
             trim(target); trim(dep);
             if (fgets(line, sizeof(line), fp)) {
                 trim(line);
-                if (line[0] == '\t' || line[0] == ' ') add_pattern_rule(target, dep, line + 1);
+                if (line[0] == '\t' || line[0] == ' ') {
+                    add_pattern_rule(target, dep, line + 1);
+                }
             }
             continue;
         }
@@ -685,42 +721,32 @@ int execute_pattern_rule(const char *target, PatternRule *rule) {
     char *stem = apply_pattern(target, rule->target_pattern);
     if (!stem) return 0;
     
-    char dep_pattern[MAX_LINE];
-    strcpy(dep_pattern, rule->dep_pattern);
-    
-    char *dep_result = malloc(MAX_LINE);
-    char *p = dep_pattern, *out = dep_result;
-    while (*p) {
-        if (*p == '*' && (p == dep_pattern || *(p-1) != '$')) {
-            strcpy(out, stem);
-            out += strlen(stem);
-            p++;
-        } else if (*p == '$' && *(p+1) == '*') {
-            strcpy(out, stem);
-            out += strlen(stem);
-            p += 2;
-        } else {
-            *out++ = *p++;
-        }
-    }
-    *out = '\0';
+    char *dep_pattern_expanded = expand_dep_pattern(rule->dep_pattern, stem);
     
     int dep_count;
-    char **deps = split_deps(dep_result, &dep_count);
+    char **deps = split_deps(dep_pattern_expanded, &dep_count);
+    
+    // Сначала компилируем все зависимости
+    for (int i = 0; i < dep_count; i++) {
+        PatternRule *dep_rule = find_pattern_rule(deps[i]);
+        if (dep_rule) {
+            int ret = execute_pattern_rule(deps[i], dep_rule);
+            if (ret != 0) return ret;
+        }
+    }
     
     if (!needs_rebuild(target, deps, dep_count) && !dry_run) {
         for (int i = 0; i < dep_count; i++) free(deps[i]);
         free(deps);
-        free(dep_result);
         return 0;
     }
     
-    set_special_vars(target, dep_count > 0 ? deps[0] : "", dep_result);
+    set_special_vars(target, dep_count > 0 ? deps[0] : "", dep_pattern_expanded);
     
     int ret = 0;
     for (int i = 0; i < rule->cmd_count; i++) {
         char *expanded = expand_string_with_special(rule->commands[i], target, 
-                                                     dep_count > 0 ? deps[0] : "", dep_result);
+                                                     dep_count > 0 ? deps[0] : "", dep_pattern_expanded);
         if (execute_single_command(expanded) != 0) {
             ret = 1;
             break;
@@ -729,23 +755,23 @@ int execute_pattern_rule(const char *target, PatternRule *rule) {
     
     for (int i = 0; i < dep_count; i++) free(deps[i]);
     free(deps);
-    free(dep_result);
     return ret;
 }
 
-// Выполнение цели по имени
 int execute_target(const char *target_name) {
     Command *cmd = find_command(target_name);
     if (cmd) {
         return execute_command(target_name, 0, NULL);
     }
     
-    PatternRule *rule = pattern_rules;
-    while (rule) {
-        if (match_pattern(target_name, rule->target_pattern)) {
-            return execute_pattern_rule(target_name, rule);
-        }
-        rule = rule->next;
+    PatternRule *rule = find_pattern_rule(target_name);
+    if (rule) {
+        return execute_pattern_rule(target_name, rule);
+    }
+    
+    // Если нет правила, но файл существует — ничего не делаем
+    if (get_mtime(target_name) != 0) {
+        return 0;
     }
     
     char msg[MAX_LINE];
@@ -757,12 +783,9 @@ int execute_target(const char *target_name) {
 int execute_command(const char *cmd_name, int flag_count, char **flags) {
     Command *cmd = find_command(cmd_name);
     if (!cmd) {
-        PatternRule *rule = pattern_rules;
-        while (rule) {
-            if (match_pattern(cmd_name, rule->target_pattern)) {
-                return execute_pattern_rule(cmd_name, rule);
-            }
-            rule = rule->next;
+        PatternRule *rule = find_pattern_rule(cmd_name);
+        if (rule) {
+            return execute_pattern_rule(cmd_name, rule);
         }
         
         char msg[MAX_LINE];
@@ -807,12 +830,11 @@ int execute_command(const char *cmd_name, int flag_count, char **flags) {
         }
     }
     
-    // Main commands - проверяем на "call"
+    // Main commands
     for (int i = 0; i < cmd->main_cmd_count; i++) {
         char *line = cmd->main_commands[i];
         char *expanded = expand_string(line);
         
-        // Проверяем, начинается ли строка с "call "
         if (strncmp(expanded, "call ", 5) == 0) {
             char *target = expanded + 5;
             trim(target);
