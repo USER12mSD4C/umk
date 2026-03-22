@@ -1,4 +1,3 @@
-// umk.c - полноценная замена make
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,31 +11,11 @@
 
 #define MAX_LINE 4096
 #define MAX_NAME 256
-#define MAX_JOBS 64
-#define MAX_FILES 1024
 
 #define COLOR_RED     "\033[31m"
 #define COLOR_GREEN   "\033[32m"
 #define COLOR_YELLOW  "\033[33m"
-#define COLOR_BLUE    "\033[34m"
-#define COLOR_CYAN    "\033[36m"
 #define COLOR_RESET   "\033[0m"
-
-typedef struct ExprNode {
-    int type;
-    char *value;
-    char *func_name;
-    struct ExprNode **args;
-    int arg_count;
-} ExprNode;
-
-typedef struct PatternRule {
-    char *target_pattern;
-    char *dep_pattern;
-    char **commands;
-    int cmd_count;
-    struct PatternRule *next;
-} PatternRule;
 
 typedef struct Flag {
     char name[MAX_NAME];
@@ -46,16 +25,21 @@ typedef struct Flag {
     struct Flag *next;
 } Flag;
 
+typedef struct Rule {
+    char *target;
+    char **deps;
+    int dep_cnt;
+    char **commands;
+    int cmd_cnt;
+    struct Rule *next;
+} Rule;
+
 typedef struct Command {
     char name[MAX_NAME];
-    char **main_commands;
-    int main_cmd_count;
+    char **commands;
+    int cmd_count;
     Flag *flags;
     struct Command *next;
-    int is_phony;
-    char **deps;
-    int dep_count;
-    int is_rule;
 } Command;
 
 typedef struct Variable {
@@ -64,74 +48,36 @@ typedef struct Variable {
     struct Variable *next;
 } Variable;
 
-typedef struct Job {
-    char *command;
-    pid_t pid;
-    int ret;
-    struct Job *next;
-} Job;
-
+Rule *rules = NULL;
 Command *commands = NULL;
 Variable *variables = NULL;
-PatternRule *pattern_rules = NULL;
+char **global_flags = NULL;
+int global_flag_count = 0;
 int use_color = 1;
-int jobs = 1;
 int dry_run = 0;
-Job *job_queue = NULL;
 
-// Прототипы
 void trim(char *str);
 int is_blank(const char *str);
-char *expand_string(const char *str);
-char *expand_string_with_special(const char *str, const char *target, const char *dep, const char *all_deps);
+char *expand(const char *str);
 void add_variable(const char *name, const char *value);
 char *get_variable(const char *name);
-void set_special_vars(const char *target, const char *dep, const char *all_deps);
-void add_command(const char *name, int is_rule);
-void add_main_command(Command *cmd, const char *line);
-void add_dependencies(Command *cmd, const char *dep_str);
+void add_rule(const char *target, const char *deps, const char *cmd);
+void add_command(const char *name);
+void add_command_line(Command *cmd, const char *line);
 void add_flag(Command *cmd, const char *flag_line);
 void add_flag_command(Flag *flag, const char *line);
-void add_pattern_rule(const char *target, const char *dep, const char *cmd);
 void parse_umkfile(const char *filename);
-int evaluate_condition(const char *expr);
-int execute_target(const char *target_name);
-int execute_commands(char **cmds, int cmd_count);
-int execute_single_command(const char *cmd);
-int execute_flag(Flag *flag);
-int execute_pattern_rule(const char *target, PatternRule *rule);
-int needs_rebuild(const char *target, char **deps, int dep_count);
+int execute(const char *target);
+int execute_shell(const char *cmd);
+int needs_rebuild(const char *target, char **deps, int dep_cnt);
 time_t get_mtime(const char *path);
 int match_pattern(const char *name, const char *pattern);
 char *apply_pattern(const char *target, const char *pattern);
-char *expand_dep_pattern(const char *pattern, const char *stem);
-char **split_deps(const char *dep_str, int *count);
-void run_jobs_parallel(void);
-void add_job(const char *cmd);
-void clear_jobs(void);
+char **split(const char *str, int *cnt);
 char *wildcard(const char *pattern);
-char *shell(const char *cmd);
+char *shell_cmd(const char *cmd);
 void print_color(const char *color, const char *msg);
-PatternRule *find_pattern_rule(const char *target);
-char **expand_variable_list(const char *var_name, int *count);
-void collect_source_files(const char *dir, char ***files, int *count);
-
-// Встроенные функции
-typedef struct {
-    char *name;
-    char *(*func)(const char **args, int arg_count);
-} BuiltinFunc;
-
-char *func_wildcard(const char **args, int arg_count);
-char *func_shell(const char **args, int arg_count);
-
-BuiltinFunc builtins[] = {
-    {"wildcard", func_wildcard},
-    {"shell", func_shell},
-    {NULL, NULL}
-};
-
-// ==== Реализация ====
+void free_all(void);
 
 time_t get_mtime(const char *path) {
     struct stat st;
@@ -139,374 +85,240 @@ time_t get_mtime(const char *path) {
     return 0;
 }
 
-int needs_rebuild(const char *target, char **deps, int dep_count) {
-    time_t target_time = get_mtime(target);
-    if (target_time == 0) return 1;
-    for (int i = 0; i < dep_count; i++) {
-        time_t dep_time = get_mtime(deps[i]);
-        if (dep_time == 0) return 1;
-        if (dep_time > target_time) return 1;
+int needs_rebuild(const char *target, char **deps, int dep_cnt) {
+    time_t t = get_mtime(target);
+    if (t == 0) return 1;
+    for (int i = 0; i < dep_cnt; i++) {
+        time_t d = get_mtime(deps[i]);
+        if (d == 0) return 1;
+        if (d > t) return 1;
     }
     return 0;
 }
 
 void trim(char *str) {
-    char *start = str;
-    char *end;
-    while (isspace((unsigned char)*start)) start++;
-    if (*start == 0) { str[0] = '\0'; return; }
-    end = start + strlen(start) - 1;
-    while (end > start && isspace((unsigned char)*end)) end--;
-    memmove(str, start, end - start + 1);
-    str[end - start + 1] = '\0';
+    char *s = str;
+    while (isspace(*s)) s++;
+    if (*s == 0) { str[0] = 0; return; }
+    char *e = s + strlen(s) - 1;
+    while (e > s && isspace(*e)) e--;
+    memmove(str, s, e - s + 1);
+    str[e - s + 1] = 0;
 }
 
 int is_blank(const char *str) {
-    while (*str) if (!isspace((unsigned char)*str++)) return 0;
+    while (*str) if (!isspace(*str++)) return 0;
     return 1;
 }
 
 void print_color(const char *color, const char *msg) {
-    if (use_color && isatty(STDERR_FILENO)) {
-        fprintf(stderr, "%s%s%s\n", color, msg, COLOR_RESET);
-    } else {
-        fprintf(stderr, "%s\n", msg);
-    }
+    if (use_color && isatty(2)) fprintf(stderr, "%s%s%s\n", color, msg, COLOR_RESET);
+    else fprintf(stderr, "%s\n", msg);
 }
 
 void add_variable(const char *name, const char *value) {
-    Variable *var = variables;
-    while (var) {
-        if (strcmp(var->name, name) == 0) {
-            free(var->value);
-            var->value = strdup(value);
+    Variable *v = variables;
+    while (v) {
+        if (strcmp(v->name, name) == 0) {
+            free(v->value);
+            v->value = strdup(value);
             return;
         }
-        var = var->next;
+        v = v->next;
     }
-    Variable *new_var = malloc(sizeof(Variable));
-    strcpy(new_var->name, name);
-    new_var->value = strdup(value);
-    new_var->next = variables;
-    variables = new_var;
+    Variable *nv = malloc(sizeof(Variable));
+    strcpy(nv->name, name);
+    nv->value = strdup(value);
+    nv->next = variables;
+    variables = nv;
 }
 
 char *get_variable(const char *name) {
-    Variable *var = variables;
-    while (var) {
-        if (strcmp(var->name, name) == 0) return var->value;
-        var = var->next;
+    Variable *v = variables;
+    while (v) {
+        if (strcmp(v->name, name) == 0) return v->value;
+        v = v->next;
     }
     return NULL;
-}
-
-void set_special_vars(const char *target, const char *dep, const char *all_deps) {
-    if (target) add_variable("@", target);
-    if (dep) add_variable("<", dep);
-    if (all_deps) add_variable("^", all_deps);
-}
-
-int match_pattern(const char *name, const char *pattern) {
-    const char *p = pattern, *n = name;
-    while (*p) {
-        if (*p == '*') {
-            p++;
-            if (!*p) return 1;
-            while (*n) if (match_pattern(n++, p)) return 1;
-            return 0;
-        } else if (*p != *n) return 0;
-        p++; n++;
-    }
-    return *n == '\0';
-}
-
-char *apply_pattern(const char *target, const char *pattern) {
-    static char result[MAX_LINE];
-    char *star_pos = (char*)strchr(pattern, '*');
-    if (!star_pos) { strcpy(result, pattern); return result; }
-    
-    int prefix_len = star_pos - pattern;
-    int suffix_len = strlen(pattern) - (prefix_len + 1);
-    if (strncmp(target, pattern, prefix_len) != 0) return NULL;
-    
-    int target_len = strlen(target);
-    if (target_len < prefix_len + suffix_len) return NULL;
-    
-    if (suffix_len > 0) {
-        const char *suffix = pattern + prefix_len + 1;
-        if (strcmp(target + target_len - suffix_len, suffix) != 0) return NULL;
-    }
-    
-    int stem_len = target_len - prefix_len - suffix_len;
-    strncpy(result, target + prefix_len, stem_len);
-    result[stem_len] = '\0';
-    return result;
-}
-
-char *expand_dep_pattern(const char *pattern, const char *stem) {
-    static char result[MAX_LINE];
-    char *p = (char*)pattern;
-    char *out = result;
-    while (*p) {
-        if (*p == '*' && (p == pattern || *(p-1) != '$')) {
-            strcpy(out, stem);
-            out += strlen(stem);
-            p++;
-        } else if (*p == '$' && *(p+1) == '*') {
-            strcpy(out, stem);
-            out += strlen(stem);
-            p += 2;
-        } else {
-            *out++ = *p++;
-        }
-    }
-    *out = '\0';
-    return result;
-}
-
-char **split_deps(const char *dep_str, int *count) {
-    char *copy = strdup(dep_str);
-    char **result = NULL;
-    *count = 0;
-    char *token = strtok(copy, " ");
-    while (token) {
-        result = realloc(result, (*count + 1) * sizeof(char*));
-        result[*count] = strdup(token);
-        (*count)++;
-        token = strtok(NULL, " ");
-    }
-    free(copy);
-    return result;
 }
 
 char *wildcard(const char *pattern) {
-    static char result[MAX_LINE];
-    result[0] = '\0';
-    DIR *dir = opendir(".");
-    if (!dir) return result;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
-        if (match_pattern(entry->d_name, pattern)) {
-            if (strlen(result) > 0) strcat(result, " ");
-            strcat(result, entry->d_name);
+    static char res[MAX_LINE];
+    res[0] = 0;
+    DIR *d = opendir(".");
+    if (!d) return res;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        if (match_pattern(e->d_name, pattern)) {
+            if (strlen(res) > 0) strcat(res, " ");
+            strcat(res, e->d_name);
         }
     }
-    closedir(dir);
-    return result;
+    closedir(d);
+    return res;
 }
 
-char *shell(const char *cmd) {
-    static char result[MAX_LINE];
-    result[0] = '\0';
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return result;
+char *shell_cmd(const char *cmd) {
+    static char res[MAX_LINE];
+    res[0] = 0;
+    FILE *f = popen(cmd, "r");
+    if (!f) return res;
     char line[MAX_LINE];
-    if (fgets(line, sizeof(line), fp)) {
+    if (fgets(line, sizeof(line), f)) {
         trim(line);
-        strcpy(result, line);
+        strcpy(res, line);
     }
-    pclose(fp);
-    return result;
+    pclose(f);
+    return res;
 }
 
-char *func_wildcard(const char **args, int arg_count) {
-    return arg_count > 0 ? wildcard(args[0]) : "";
-}
-
-char *func_shell(const char **args, int arg_count) {
-    return arg_count > 0 ? shell(args[0]) : "";
-}
-
-char *expand_string(const char *str) {
-    static char result[MAX_LINE];
-    result[0] = '\0';
+int match_pattern(const char *name, const char *pattern) {
+    char p[MAX_LINE];
+    strcpy(p, pattern);
+    for (char *x = p; *x; x++) if (*x == '%') *x = '*';
     
+    const char *pp = p, *nn = name;
+    while (*pp) {
+        if (*pp == '*') {
+            pp++;
+            if (!*pp) return 1;
+            while (*nn) {
+                if (match_pattern(nn, pp)) return 1;
+                nn++;
+            }
+            return 0;
+        } else if (*pp != *nn) {
+            return 0;
+        }
+        pp++; nn++;
+    }
+    return *nn == 0;
+}
+
+char *apply_pattern(const char *target, const char *pattern) {
+    static char res[MAX_LINE];
+    char p[MAX_LINE];
+    strcpy(p, pattern);
+    for (char *x = p; *x; x++) if (*x == '%') *x = '*';
+    
+    char *star = strchr(p, '*');
+    if (!star) { strcpy(res, pattern); return res; }
+    
+    int pre = star - p;
+    int suf = strlen(p) - (pre + 1);
+    if (strncmp(target, p, pre) != 0) return NULL;
+    int tlen = strlen(target);
+    if (tlen < pre + suf) return NULL;
+    if (suf > 0) {
+        const char *s = p + pre + 1;
+        if (strcmp(target + tlen - suf, s) != 0) return NULL;
+    }
+    int stem_len = tlen - pre - suf;
+    strncpy(res, target + pre, stem_len);
+    res[stem_len] = 0;
+    return res;
+}
+
+char **split(const char *str, int *cnt) {
+    char *copy = strdup(str);
+    char **res = NULL;
+    *cnt = 0;
+    char *tok = strtok(copy, " ");
+    while (tok) {
+        res = realloc(res, (*cnt + 1) * sizeof(char*));
+        res[*cnt] = strdup(tok);
+        (*cnt)++;
+        tok = strtok(NULL, " ");
+    }
+    free(copy);
+    return res;
+}
+
+char *expand(const char *str) {
+    static char res[MAX_LINE];
+    res[0] = 0;
     const char *p = str;
     while (*p) {
-        if (*p == '$' && *(p+1) == '(') {
+        if (*p == '$' && p[1] == '(') {
             const char *end = strchr(p, ')');
-            if (!end) { strncat(result, p, MAX_LINE - strlen(result) - 1); break; }
-            
+            if (!end) { strncat(res, p, MAX_LINE - strlen(res) - 1); break; }
             char *inner = malloc(end - p - 1);
             strncpy(inner, p + 2, end - p - 2);
-            inner[end - p - 2] = '\0';
-            
+            inner[end - p - 2] = 0;
             char *space = strchr(inner, ' ');
             if (space) {
-                *space = '\0';
-                char *func_name = inner;
-                char *args_str = space + 1;
-                
-                int arg_count = 1;
-                for (char *q = args_str; *q; q++) if (*q == ' ') arg_count++;
-                
-                const char **args = malloc(arg_count * sizeof(char*));
-                char *arg = strtok(args_str, " ");
+                *space = 0;
+                char *func = inner;
+                char *args = space + 1;
+                int ac = 1;
+                for (char *q = args; *q; q++) if (*q == ' ') ac++;
+                const char **av = malloc(ac * sizeof(char*));
+                char *arg = strtok(args, " ");
                 int i = 0;
-                while (arg) {
-                    args[i++] = arg;
-                    arg = strtok(NULL, " ");
-                }
-                
+                while (arg) { av[i++] = arg; arg = strtok(NULL, " "); }
                 char *val = "";
-                for (int j = 0; builtins[j].name; j++) {
-                    if (strcmp(func_name, builtins[j].name) == 0) {
-                        val = builtins[j].func(args, arg_count);
-                        break;
-                    }
-                }
-                strcat(result, val);
-                free(args);
+                if (strcmp(func, "wildcard") == 0) val = wildcard(av[0]);
+                else if (strcmp(func, "shell") == 0) val = shell_cmd(av[0]);
+                strcat(res, val);
+                free(av);
             } else {
                 char *val = get_variable(inner);
-                if (val) strcat(result, val);
+                if (val) strcat(res, val);
             }
             free(inner);
             p = end + 1;
         } else {
-            char ch[2] = {*p, '\0'};
-            strcat(result, ch);
+            char ch[2] = {*p, 0};
+            strcat(res, ch);
             p++;
         }
     }
-    return result;
+    return res;
 }
 
-char *expand_string_with_special(const char *str, const char *target, const char *dep, const char *all_deps) {
-    static char result[MAX_LINE];
-    result[0] = '\0';
-    
-    const char *p = str;
-    while (*p) {
-        if (*p == '$' && *(p+1) == '@') {
-            strcat(result, target);
-            p += 2;
-        } else if (*p == '$' && *(p+1) == '<') {
-            strcat(result, dep);
-            p += 2;
-        } else if (*p == '$' && *(p+1) == '^') {
-            strcat(result, all_deps);
-            p += 2;
-        } else if (*p == '$' && *(p+1) == '(') {
-            const char *end = strchr(p, ')');
-            if (!end) { strncat(result, p, MAX_LINE - strlen(result) - 1); break; }
-            
-            char *inner = malloc(end - p - 1);
-            strncpy(inner, p + 2, end - p - 2);
-            inner[end - p - 2] = '\0';
-            
-            char *space = strchr(inner, ' ');
-            if (space) {
-                *space = '\0';
-                char *func_name = inner;
-                char *args_str = space + 1;
-                
-                int arg_count = 1;
-                for (char *q = args_str; *q; q++) if (*q == ' ') arg_count++;
-                
-                const char **args = malloc(arg_count * sizeof(char*));
-                char *arg = strtok(args_str, " ");
-                int i = 0;
-                while (arg) {
-                    args[i++] = arg;
-                    arg = strtok(NULL, " ");
-                }
-                
-                char *val = "";
-                for (int j = 0; builtins[j].name; j++) {
-                    if (strcmp(func_name, builtins[j].name) == 0) {
-                        val = builtins[j].func(args, arg_count);
-                        break;
-                    }
-                }
-                strcat(result, val);
-                free(args);
-            } else {
-                char *val = get_variable(inner);
-                if (val) strcat(result, val);
-            }
-            free(inner);
-            p = end + 1;
-        } else {
-            char ch[2] = {*p, '\0'};
-            strcat(result, ch);
-            p++;
-        }
-    }
-    return result;
+void add_rule(const char *target, const char *deps, const char *cmd) {
+    Rule *r = malloc(sizeof(Rule));
+    r->target = strdup(target);
+    r->deps = split(deps, &r->dep_cnt);
+    r->commands = malloc(sizeof(char*));
+    r->commands[0] = strdup(cmd);
+    r->cmd_cnt = 1;
+    r->next = rules;
+    rules = r;
 }
 
-int evaluate_condition(const char *expr) {
-    char expanded[MAX_LINE];
-    strcpy(expanded, expand_string(expr));
-    trim(expanded);
-    
-    char *eq = strchr(expanded, '=');
-    if (eq && *(eq+1) == '=') {
-        *eq = '\0';
-        char *left = expanded;
-        char *right = eq + 2;
-        trim(left);
-        trim(right);
-        return strcmp(left, right) == 0;
-    }
-    return strlen(expanded) > 0 && strcmp(expanded, "0") != 0;
+void add_command(const char *name) {
+    Command *c = malloc(sizeof(Command));
+    strcpy(c->name, name);
+    c->commands = NULL;
+    c->cmd_count = 0;
+    c->flags = NULL;
+    c->next = commands;
+    commands = c;
 }
 
-void add_command(const char *name, int is_rule) {
-    Command *new_cmd = malloc(sizeof(Command));
-    strcpy(new_cmd->name, name);
-    new_cmd->main_commands = NULL;
-    new_cmd->main_cmd_count = 0;
-    new_cmd->flags = NULL;
-    new_cmd->next = commands;
-    new_cmd->is_phony = !is_rule;
-    new_cmd->deps = NULL;
-    new_cmd->dep_count = 0;
-    new_cmd->is_rule = is_rule;
-    commands = new_cmd;
-}
-
-Command *find_command(const char *name) {
-    Command *cmd = commands;
-    while (cmd) {
-        if (strcmp(cmd->name, name) == 0) return cmd;
-        cmd = cmd->next;
-    }
-    return NULL;
-}
-
-void add_main_command(Command *cmd, const char *line) {
-    cmd->main_commands = realloc(cmd->main_commands, (cmd->main_cmd_count + 1) * sizeof(char*));
-    cmd->main_commands[cmd->main_cmd_count] = strdup(line);
-    cmd->main_cmd_count++;
-}
-
-void add_dependencies(Command *cmd, const char *dep_str) {
-    char *expanded = expand_string(dep_str);
-    cmd->deps = split_deps(expanded, &cmd->dep_count);
+void add_command_line(Command *cmd, const char *line) {
+    cmd->commands = realloc(cmd->commands, (cmd->cmd_count + 1) * sizeof(char*));
+    cmd->commands[cmd->cmd_count] = strdup(line);
+    cmd->cmd_count++;
 }
 
 void add_flag(Command *cmd, const char *flag_line) {
-    Flag *new_flag = malloc(sizeof(Flag));
-    new_flag->commands = NULL;
-    new_flag->cmd_count = 0;
-    new_flag->next = cmd->flags;
-    cmd->flags = new_flag;
-    
-    char line_copy[MAX_LINE];
-    strcpy(line_copy, flag_line);
-    trim(line_copy);
-    
-    if (strncmp(line_copy, "-fg(", 4) == 0) new_flag->type = 0;
-    else new_flag->type = 1;
-    
-    char *start = strchr(line_copy, '(') + 1;
+    Flag *f = malloc(sizeof(Flag));
+    f->commands = NULL;
+    f->cmd_count = 0;
+    f->next = cmd->flags;
+    cmd->flags = f;
+    char copy[MAX_LINE];
+    strcpy(copy, flag_line);
+    trim(copy);
+    f->type = (copy[0] == '-') ? 0 : 1;
+    char *start = strchr(copy, '(') + 1;
     char *end = strchr(start, ')');
     int len = end - start;
-    strncpy(new_flag->name, start, len);
-    new_flag->name[len] = '\0';
+    strncpy(f->name, start, len);
+    f->name[len] = 0;
 }
 
 void add_flag_command(Flag *flag, const char *line) {
@@ -515,510 +327,400 @@ void add_flag_command(Flag *flag, const char *line) {
     flag->cmd_count++;
 }
 
-void add_pattern_rule(const char *target, const char *dep, const char *cmd) {
-    PatternRule *rule = malloc(sizeof(PatternRule));
-    rule->target_pattern = strdup(target);
-    rule->dep_pattern = strdup(dep);
-    rule->commands = malloc(sizeof(char*));
-    rule->commands[0] = strdup(cmd);
-    rule->cmd_count = 1;
-    rule->next = pattern_rules;
-    pattern_rules = rule;
-}
-
-PatternRule *find_pattern_rule(const char *target) {
-    PatternRule *rule = pattern_rules;
-    while (rule) {
-        if (match_pattern(target, rule->target_pattern)) return rule;
-        rule = rule->next;
-    }
-    return NULL;
-}
-
-void parse_umkfile(const char *filename) {
-    FILE *fp = fopen(filename, "r");
-    if (!fp) { print_color(COLOR_RED, "No UMK file found"); exit(1); }
+void parse_umkfile(const char *file) {
+    FILE *fp = fopen(file, "r");
+    if (!fp) { print_color(COLOR_RED, "No UMK file"); exit(1); }
     
     char line[MAX_LINE];
-    Command *current_cmd = NULL;
-    Flag *current_flag = NULL;
-    int in_flags_block = 0, in_flag = 0;
-    int in_condition = 0, condition_result = 1, skip_until_endif = 0;
+    Command *cur_cmd = NULL;
+    Flag *cur_flag = NULL;
+    int in_flags = 0, in_flag = 0;
     
     while (fgets(line, sizeof(line), fp)) {
-        char original[MAX_LINE];
-        strcpy(original, line);
+        char orig[MAX_LINE];
+        strcpy(orig, line);
         trim(line);
         if (is_blank(line)) continue;
         
-        if (strncmp(line, "if ", 3) == 0) {
-            in_condition = 1;
-            condition_result = evaluate_condition(line + 3);
-            skip_until_endif = !condition_result;
-            continue;
-        }
-        if (strcmp(line, "else") == 0) {
-            if (in_condition) { skip_until_endif = condition_result; condition_result = !condition_result; }
-            continue;
-        }
-        if (strcmp(line, "endif") == 0) { in_condition = 0; skip_until_endif = 0; condition_result = 1; continue; }
-        if (skip_until_endif) continue;
-        
         char *eq = strchr(line, '=');
-        if (eq && !in_flags_block && !current_cmd && !in_condition) {
-            *eq = '\0';
-            char *var_name = line, *var_value = eq + 1;
-            trim(var_name); trim(var_value);
-            add_variable(var_name, expand_string(var_value));
+        if (eq && !in_flags && !cur_cmd) {
+            *eq = 0;
+            char *name = line, *val = eq + 1;
+            trim(name); trim(val);
+            add_variable(name, expand(val));
             continue;
         }
         
         char *colon = strchr(line, ':');
-        if (colon && strchr(line, '%') && !in_flags_block && !current_cmd) {
-            *colon = '\0';
-            char *target = line, *dep = colon + 1;
-            trim(target); trim(dep);
-            if (fgets(line, sizeof(line), fp)) {
-                trim(line);
-                if (line[0] == '\t' || line[0] == ' ') {
-                    add_pattern_rule(target, dep, line + 1);
+        if (colon && !in_flags && !cur_cmd) {
+            *colon = 0;
+            char *target = line;
+            char *deps = colon + 1;
+            trim(target);
+            trim(deps);
+            
+            long pos = ftell(fp);
+            char next_line[MAX_LINE];
+            
+            if (fgets(next_line, sizeof(next_line), fp)) {
+                char trimmed_next[MAX_LINE];
+                strcpy(trimmed_next, next_line);
+                trim(trimmed_next);
+                
+                // Если есть зависимости — это правило
+                if (strlen(deps) > 0) {
+                    Rule *r = malloc(sizeof(Rule));
+                    r->target = strdup(target);
+                    char *expanded_deps = expand(deps);
+                    r->deps = split(expanded_deps, &r->dep_cnt);
+                    r->commands = NULL;
+                    r->cmd_cnt = 0;
+                    r->next = rules;
+                    rules = r;
+                    
+                    if (next_line[0] == '\t') {
+                        r->commands = realloc(r->commands, sizeof(char*));
+                        r->commands[0] = strdup(trimmed_next);
+                        r->cmd_cnt = 1;
+                    }
+                    
+                    while (fgets(line, sizeof(line), fp)) {
+                        char line_copy[MAX_LINE];
+                        strcpy(line_copy, line);
+                        trim(line_copy);
+                        if (strcmp(line_copy, "eoc") == 0) break;
+                        if (line[0] == '\t') {
+                            trim(line_copy);
+                            r->commands = realloc(r->commands, (r->cmd_cnt + 1) * sizeof(char*));
+                            r->commands[r->cmd_cnt] = strdup(line_copy);
+                            r->cmd_cnt++;
+                        }
+                    }
+                } else {
+                    add_command(target);
+                    cur_cmd = commands;
+                    fseek(fp, pos, SEEK_SET);
                 }
+            } else {
+                add_command(target);
             }
             continue;
         }
         
-        if (strcmp(line, "eoc") == 0) { current_cmd = NULL; in_flags_block = 0; in_flag = 0; continue; }
-        
-        colon = strchr(line, ':');
-        if (colon && !in_flags_block && strcmp(line, "+flags:") != 0) {
-            int in_quotes = 0, is_command = 1;
-            for (char *p = line; p < colon; p++) { if (*p == '"') in_quotes = !in_quotes; if (in_quotes) { is_command = 0; break; } }
-            if (is_command) {
-                *colon = '\0';
-                add_command(line, 1);
-                current_cmd = commands;
-                char *deps_str = colon + 1;
-                trim(deps_str);
-                if (strlen(deps_str) > 0) {
-                    add_dependencies(current_cmd, deps_str);
-                }
-                continue;
-            }
+        if (strcmp(line, "eoc") == 0) {
+            cur_cmd = NULL;
+            in_flags = 0;
+            in_flag = 0;
+            continue;
         }
         
-        if (!current_cmd) continue;
-        if (strcmp(line, "+flags:") == 0) { in_flags_block = 1; continue; }
+        if (!cur_cmd) continue;
         
-        if (in_flags_block) {
-            if (strcmp(line, ";") == 0) { in_flags_block = 0; current_flag = NULL; continue; }
+        if (strcmp(line, "+flags:") == 0) {
+            in_flags = 1;
+            continue;
+        }
+        
+        if (in_flags) {
+            if (strcmp(line, ";") == 0) {
+                in_flags = 0;
+                cur_flag = NULL;
+                continue;
+            }
             
-            char *trimmed = original;
-            while (isspace((unsigned char)*trimmed)) trimmed++;
-            if ((strncmp(trimmed, "-fg(", 4) == 0 || strncmp(trimmed, "+fg(", 4) == 0)) {
-                add_flag(current_cmd, trimmed);
-                current_flag = current_cmd->flags;
+            char *trimmed = orig;
+            while (isspace(*trimmed)) trimmed++;
+            if (strncmp(trimmed, "-fg(", 4) == 0 || strncmp(trimmed, "+fg(", 4) == 0) {
+                Flag *f = malloc(sizeof(Flag));
+                f->commands = NULL;
+                f->cmd_count = 0;
+                f->next = cur_cmd->flags;
+                cur_cmd->flags = f;
+                
+                char copy[MAX_LINE];
+                strcpy(copy, trimmed);
+                trim(copy);
+                f->type = (copy[0] == '-') ? 0 : 1;
+                
+                char *start = strchr(copy, '(') + 1;
+                char *end = strchr(start, ')');
+                int len = end - start;
+                strncpy(f->name, start, len);
+                f->name[len] = 0;
+                
+                cur_flag = f;
                 in_flag = 1;
                 continue;
             }
-            if (strcmp(line, "eofg") == 0) { current_flag = NULL; in_flag = 0; continue; }
-            if (in_flag && current_flag) { add_flag_command(current_flag, line); continue; }
+            
+            if (strcmp(line, "eofg") == 0) {
+                cur_flag = NULL;
+                in_flag = 0;
+                continue;
+            }
+            
+            if (in_flag && cur_flag) {
+                cur_flag->commands = realloc(cur_flag->commands, (cur_flag->cmd_count + 1) * sizeof(char*));
+                cur_flag->commands[cur_flag->cmd_count] = strdup(line);
+                cur_flag->cmd_count++;
+                continue;
+            }
         }
         
-        if (!in_flags_block) add_main_command(current_cmd, line);
+        if (!in_flags && line[0] != '\t') {
+            add_command_line(cur_cmd, line);
+        }
     }
     fclose(fp);
 }
 
-void add_job(const char *cmd) {
-    Job *job = malloc(sizeof(Job));
-    job->command = strdup(cmd);
-    job->next = job_queue;
-    job_queue = job;
-}
-
-void run_jobs_parallel(void) {
-    Job *job = job_queue;
-    int active_jobs = 0;
-    
-    while (job || active_jobs > 0) {
-        while (active_jobs < jobs && job) {
-            pid_t pid = fork();
-            if (pid == 0) { execl("/bin/sh", "sh", "-c", job->command, NULL); exit(1); }
-            else if (pid > 0) { job->pid = pid; active_jobs++; job = job->next; }
-        }
-        int status;
-        pid_t done = wait(&status);
-        Job *j = job_queue;
-        while (j) { if (j->pid == done) { j->ret = WEXITSTATUS(status); active_jobs--; break; } j = j->next; }
-    }
-    
-    Job *j = job_queue;
-    while (j) {
-        if (j->ret != 0) {
-            char msg[MAX_LINE];
-            snprintf(msg, sizeof(msg), "Error: %s", j->command);
-            print_color(COLOR_RED, msg);
-            exit(j->ret);
-        }
-        j = j->next;
-    }
-}
-
-void clear_jobs(void) {
-    Job *j = job_queue;
-    while (j) { Job *next = j->next; free(j->command); free(j); j = next; }
-    job_queue = NULL;
-}
-
-int execute_single_command(const char *cmd) {
+int execute_shell(const char *cmd) {
     if (dry_run) { printf("%s\n", cmd); return 0; }
+    printf("%s\n", cmd);
+    fflush(stdout);
     int ret = system(cmd);
     if (ret != 0) {
         char msg[MAX_LINE];
-        snprintf(msg, sizeof(msg), "Error: %s", cmd);
+        snprintf(msg, sizeof(msg), "Error: %s (exit code: %d)", cmd, ret);
         print_color(COLOR_RED, msg);
         return ret;
     }
     return 0;
 }
 
-int execute_commands(char **cmds, int cmd_count) {
-    if (jobs > 1) {
-        for (int i = 0; i < cmd_count; i++) add_job(cmds[i]);
-        run_jobs_parallel();
-        clear_jobs();
-        return 0;
-    } else {
-        for (int i = 0; i < cmd_count; i++) {
-            int ret = execute_single_command(cmds[i]);
-            if (ret != 0) return ret;
-        }
-        return 0;
-    }
-}
-
-int execute_flag(Flag *flag) {
-    for (int i = 0; i < flag->cmd_count; i++) {
-        char *expanded = expand_string(flag->commands[i]);
-        
-        // Проверяем, начинается ли строка с "call "
-        char clean_line[MAX_LINE];
-        strcpy(clean_line, expanded);
-        trim(clean_line);
-        
-        if (strncmp(clean_line, "call ", 5) == 0) {
-            char *target = clean_line + 5;
-            trim(target);
-            int ret = execute_target(target);
-            if (ret != 0) return ret;
-        } else {
-            int ret = execute_single_command(clean_line);
-            if (ret != 0) return ret;
-        }
-    }
-    return 0;
-}
-
-char *expand_rule_command(const char *cmd, const char *target, char **deps, int dep_count) {
-    static char result[MAX_LINE];
-    result[0] = '\0';
+int execute(const char *target_name) {
+    char clean[MAX_LINE];
+    strcpy(clean, target_name);
+    trim(clean);
+    if (strlen(clean) == 0) return 0;
     
-    // Собираем все зависимости в строку
-    char all_deps[MAX_LINE];
-    all_deps[0] = '\0';
-    for (int i = 0; i < dep_count; i++) {
-        if (i > 0) strcat(all_deps, " ");
-        strcat(all_deps, deps[i]);
+    // Ищем команду
+    Command *c = commands;
+    while (c) {
+        if (strcmp(c->name, clean) == 0) break;
+        c = c->next;
     }
     
-    const char *p = cmd;
-    while (*p) {
-        if (*p == '$' && *(p+1) == '@') {
-            strcat(result, target);
-            p += 2;
-        } else if (*p == '$' && *(p+1) == '<') {
-            if (dep_count > 0) {
-                strcat(result, deps[0]);
+    if (c) {
+        // BEFORE flags
+        Flag *f = c->flags;
+        while (f) {
+            for (int i = 0; i < global_flag_count; i++) {
+                char *flag_name = global_flags[i];
+                if (flag_name[0] == '-') {
+                    if (flag_name[1] == '-') flag_name += 2;
+                    else flag_name += 1;
+                }
+                if (strcmp(f->name, flag_name) == 0 && f->type == 0) {
+                    for (int j = 0; j < f->cmd_count; j++) {
+                        char *exp = expand(f->commands[j]);
+                        char line[MAX_LINE];
+                        strcpy(line, exp);
+                        trim(line);
+                        if (strncmp(line, "call ", 5) == 0) {
+                            char *target = line + 5;
+                            trim(target);
+                            int ret = execute(target);
+                            if (ret != 0) return ret;
+                        } else {
+                            int ret = execute_shell(line);
+                            if (ret != 0) return ret;
+                        }
+                    }
+                }
             }
-            p += 2;
-        } else if (*p == '$' && *(p+1) == '^') {
-            strcat(result, all_deps);
-            p += 2;
-        } else if (*p == '$' && *(p+1) == '(') {
-            const char *end = strchr(p, ')');
-            if (!end) {
-                char ch[2] = {*p, '\0'};
-                strcat(result, ch);
-                p++;
-                continue;
-            }
-            
-            char *inner = malloc(end - p - 1);
-            strncpy(inner, p + 2, end - p - 2);
-            inner[end - p - 2] = '\0';
-            
-            char *val = get_variable(inner);
-            if (val) strcat(result, val);
-            else strcat(result, inner);
-            
-            free(inner);
-            p = end + 1;
-        } else {
-            char ch[2] = {*p, '\0'};
-            strcat(result, ch);
-            p++;
+            f = f->next;
         }
+        
+        // Основные команды
+        for (int i = 0; i < c->cmd_count; i++) {
+            char *exp = expand(c->commands[i]);
+            char line[MAX_LINE];
+            strcpy(line, exp);
+            trim(line);
+            if (strncmp(line, "call ", 5) == 0) {
+                char *target = line + 5;
+                trim(target);
+                int ret = execute(target);
+                if (ret != 0) return ret;
+            } else {
+                int ret = execute_shell(line);
+                if (ret != 0) return ret;
+            }
+        }
+        
+        // AFTER flags
+        f = c->flags;
+        while (f) {
+            for (int i = 0; i < global_flag_count; i++) {
+                char *flag_name = global_flags[i];
+                if (flag_name[0] == '-') {
+                    if (flag_name[1] == '-') flag_name += 2;
+                    else flag_name += 1;
+                }
+                if (strcmp(f->name, flag_name) == 0 && f->type == 1) {
+                    for (int j = 0; j < f->cmd_count; j++) {
+                        char *exp = expand(f->commands[j]);
+                        char line[MAX_LINE];
+                        strcpy(line, exp);
+                        trim(line);
+                        if (strncmp(line, "call ", 5) == 0) {
+                            char *target = line + 5;
+                            trim(target);
+                            int ret = execute(target);
+                            if (ret != 0) return ret;
+                        } else {
+                            int ret = execute_shell(line);
+                            if (ret != 0) return ret;
+                        }
+                    }
+                }
+            }
+            f = f->next;
+        }
+        return 0;
     }
     
-    return result;
-}
-
-int execute_pattern_rule(const char *target, PatternRule *rule) {
-    char *stem = apply_pattern(target, rule->target_pattern);
-    if (!stem) return 0;
+    // Ищем правило
+    Rule *r = rules;
+    while (r) {
+        if (match_pattern(clean, r->target)) break;
+        r = r->next;
+    }
     
-    char *dep_pattern_expanded = expand_dep_pattern(rule->dep_pattern, stem);
-    
-    int dep_count;
-    char **deps = split_deps(dep_pattern_expanded, &dep_count);
-    
-    // Сначала компилируем зависимости
-    for (int i = 0; i < dep_count; i++) {
-        PatternRule *dep_rule = find_pattern_rule(deps[i]);
-        if (dep_rule) {
-            int ret = execute_pattern_rule(deps[i], dep_rule);
+    if (r) {
+        char **deps_exp = NULL;
+        int dep_cnt = 0;
+        
+        if (strchr(r->target, '%')) {
+            char *stem = apply_pattern(clean, r->target);
+            if (stem) {
+                for (int i = 0; i < r->dep_cnt; i++) {
+                    char buf[MAX_LINE];
+                    strcpy(buf, r->deps[i]);
+                    char res[MAX_LINE];
+                    res[0] = 0;
+                    char *p = buf;
+                    while (*p) {
+                        if (*p == '%') {
+                            strcat(res, stem);
+                            p++;
+                        } else {
+                            char ch[2] = {*p, 0};
+                            strcat(res, ch);
+                            p++;
+                        }
+                    }
+                    deps_exp = realloc(deps_exp, (dep_cnt + 1) * sizeof(char*));
+                    deps_exp[dep_cnt] = strdup(res);
+                    dep_cnt++;
+                }
+            }
+        } else {
+            deps_exp = r->deps;
+            dep_cnt = r->dep_cnt;
+        }
+        
+        for (int i = 0; i < dep_cnt; i++) {
+            int ret = execute(deps_exp[i]);
+            if (ret != 0) return ret;
+        }
+        
+        if (!needs_rebuild(clean, deps_exp, dep_cnt) && dry_run == 0) {
+            if (deps_exp != r->deps) {
+                for (int i = 0; i < dep_cnt; i++) free(deps_exp[i]);
+                free(deps_exp);
+            }
+            return 0;
+        }
+        
+        for (int i = 0; i < r->cmd_cnt; i++) {
+            char cmd_buf[MAX_LINE];
+            strcpy(cmd_buf, r->commands[i]);
+            char res[MAX_LINE];
+            res[0] = 0;
+            char *p = cmd_buf;
+            while (*p) {
+                if (*p == '$' && p[1] == '@') {
+                    strcat(res, clean);
+                    p += 2;
+                } else if (*p == '$' && p[1] == '<') {
+                    if (dep_cnt > 0) strcat(res, deps_exp[0]);
+                    p += 2;
+                } else if (*p == '$' && p[1] == '^') {
+                    for (int j = 0; j < dep_cnt; j++) {
+                        if (j > 0) strcat(res, " ");
+                        strcat(res, deps_exp[j]);
+                    }
+                    p += 2;
+                } else {
+                    char ch[2] = {*p, 0};
+                    strcat(res, ch);
+                    p++;
+                }
+            }
+            char *exp = expand(res);
+            int ret = execute_shell(exp);
             if (ret != 0) {
-                for (int j = 0; j < dep_count; j++) free(deps[j]);
-                free(deps);
+                if (deps_exp != r->deps) {
+                    for (int j = 0; j < dep_cnt; j++) free(deps_exp[j]);
+                    free(deps_exp);
+                }
                 return ret;
             }
         }
-    }
-    
-    // Проверяем, нужно ли пересобирать
-    if (!needs_rebuild(target, deps, dep_count) && !dry_run) {
-        for (int i = 0; i < dep_count; i++) free(deps[i]);
-        free(deps);
-        return 0;
-    }
-    
-    // Выполняем команды с подстановкой $@, $<, $^
-    for (int i = 0; i < rule->cmd_count; i++) {
-        char *expanded = expand_rule_command(rule->commands[i], target, deps, dep_count);
-        int ret = execute_single_command(expanded);
-        if (ret != 0) {
-            for (int j = 0; j < dep_count; j++) free(deps[j]);
-            free(deps);
-            return ret;
-        }
-    }
-    
-    for (int i = 0; i < dep_count; i++) free(deps[i]);
-    free(deps);
-    return 0;
-}
-
-int execute_target(const char *target_name) {
-    // Очищаем от пробелов и проверяем
-    if (!target_name) return 0;
-    
-    char clean_target[MAX_LINE];
-    strcpy(clean_target, target_name);
-    trim(clean_target);
-    
-    if (strlen(clean_target) == 0) return 0;
-    
-    Command *cmd = find_command(clean_target);
-    if (cmd) {
-        // Выполняем команду/правило
-        if (cmd->is_rule && cmd->dep_count > 0) {
-            // Проверяем зависимости
-            int need_build = 1;
-            if (!cmd->is_phony) {
-                need_build = needs_rebuild(clean_target, cmd->deps, cmd->dep_count);
-            }
-            
-            if (!need_build && !dry_run) return 0;
-            
-            // Сначала выполняем зависимости
-            for (int i = 0; i < cmd->dep_count; i++) {
-                int ret = execute_target(cmd->deps[i]);
-                if (ret != 0) return ret;
-            }
-        }
         
-        // Выполняем команды
-        for (int i = 0; i < cmd->main_cmd_count; i++) {
-            char *line = cmd->main_commands[i];
-            char *expanded = expand_string(line);
-            
-            // Очищаем от пробелов
-            char clean_line[MAX_LINE];
-            strcpy(clean_line, expanded);
-            trim(clean_line);
-            
-            if (strlen(clean_line) == 0) continue;
-            
-            // Если строка начинается с "call " — рекурсивный вызов
-            if (strncmp(clean_line, "call ", 5) == 0) {
-                char *target = clean_line + 5;
-                trim(target);
-                if (strlen(target) > 0) {
-                    int ret = execute_target(target);
-                    if (ret != 0) return ret;
-                }
-            } else {
-                int ret = execute_single_command(clean_line);
-                if (ret != 0) return ret;
-            }
+        if (deps_exp != r->deps) {
+            for (int i = 0; i < dep_cnt; i++) free(deps_exp[i]);
+            free(deps_exp);
         }
         return 0;
     }
     
-    // Ищем паттерн-правило
-    PatternRule *rule = find_pattern_rule(clean_target);
-    if (rule) {
-        return execute_pattern_rule(clean_target, rule);
-    }
-    
-    // Если файл существует — ничего не делаем
-    if (get_mtime(clean_target) != 0) return 0;
+    if (get_mtime(clean) != 0) return 0;
     
     char msg[MAX_LINE];
-    snprintf(msg, sizeof(msg), "Unknown target: %s", clean_target);
+    snprintf(msg, sizeof(msg), "Unknown target: %s", clean);
     print_color(COLOR_RED, msg);
     return 1;
 }
 
-int execute_command(const char *cmd_name, int flag_count, char **flags) {
-    // Очищаем имя команды
-    if (!cmd_name) return 0;
-    
-    char clean_cmd[MAX_LINE];
-    strcpy(clean_cmd, cmd_name);
-    trim(clean_cmd);
-    
-    if (strlen(clean_cmd) == 0) return 0;
-    
-    Command *cmd = find_command(clean_cmd);
-    if (!cmd) {
-        return execute_target(clean_cmd);
+void free_all(void) {
+    Rule *r = rules;
+    while (r) {
+        Rule *next = r->next;
+        free(r->target);
+        for (int i = 0; i < r->dep_cnt; i++) free(r->deps[i]);
+        free(r->deps);
+        for (int i = 0; i < r->cmd_cnt; i++) free(r->commands[i]);
+        free(r->commands);
+        free(r);
+        r = next;
     }
     
-    // Если это правило с зависимостями — обрабатываем как цель
-    if (cmd->is_rule && cmd->dep_count > 0) {
-        return execute_target(clean_cmd);
-    }
-    
-    Flag *requested_flags[MAX_NAME];
-    int requested_count = 0;
-    
-    for (int i = 0; i < flag_count; i++) {
-        char *flag_name = flags[i];
-        if (flag_name[0] == '-') {
-            if (flag_name[1] == '-') flag_name += 2;
-            else flag_name += 1;
-        }
-        
-        Flag *f = cmd->flags;
-        int found = 0;
+    Command *c = commands;
+    while (c) {
+        Command *next = c->next;
+        for (int i = 0; i < c->cmd_count; i++) free(c->commands[i]);
+        free(c->commands);
+        Flag *f = c->flags;
         while (f) {
-            if (strcmp(f->name, flag_name) == 0) {
-                requested_flags[requested_count++] = f;
-                found = 1;
-                break;
-            }
-            f = f->next;
+            Flag *nextf = f->next;
+            for (int i = 0; i < f->cmd_count; i++) free(f->commands[i]);
+            free(f->commands);
+            free(f);
+            f = nextf;
         }
-        if (!found) {
-            char msg[MAX_LINE];
-            snprintf(msg, sizeof(msg), "Unknown flag: %s", flags[i]);
-            print_color(COLOR_RED, msg);
-            return 1;
-        }
+        free(c);
+        c = next;
     }
     
-    // BEFORE flags
-    for (int i = 0; i < requested_count; i++) {
-        if (requested_flags[i]->type == 0) {
-            int ret = execute_flag(requested_flags[i]);
-            if (ret != 0) return ret;
-        }
-    }
-    
-    // Выполняем команды
-    for (int i = 0; i < cmd->main_cmd_count; i++) {
-        char *line = cmd->main_commands[i];
-        char *expanded = expand_string(line);
-        
-        char clean_line[MAX_LINE];
-        strcpy(clean_line, expanded);
-        trim(clean_line);
-        
-        if (strlen(clean_line) == 0) continue;
-        
-        // Если строка начинается с "call " — вызов цели
-        if (strncmp(clean_line, "call ", 5) == 0) {
-            char *target = clean_line + 5;
-            trim(target);
-            if (strlen(target) > 0) {
-                int ret = execute_target(target);
-                if (ret != 0) return ret;
-            }
-        } else {
-            int ret = execute_single_command(clean_line);
-            if (ret != 0) return ret;
-        }
-    }
-    
-    // AFTER flags
-    for (int i = 0; i < requested_count; i++) {
-        if (requested_flags[i]->type == 1) {
-            int ret = execute_flag(requested_flags[i]);
-            if (ret != 0) return ret;
-        }
-    }
-    
-    return 0;
-}
-
-void free_commands() {
-    Command *cmd = commands;
-    while (cmd) {
-        Command *next = cmd->next;
-        for (int i = 0; i < cmd->main_cmd_count; i++) free(cmd->main_commands[i]);
-        free(cmd->main_commands);
-        for (int i = 0; i < cmd->dep_count; i++) free(cmd->deps[i]);
-        free(cmd->deps);
-        Flag *flag = cmd->flags;
-        while (flag) {
-            Flag *next_flag = flag->next;
-            for (int i = 0; i < flag->cmd_count; i++) free(flag->commands[i]);
-            free(flag->commands);
-            free(flag);
-            flag = next_flag;
-        }
-        free(cmd);
-        cmd = next;
-    }
-    
-    Variable *var = variables;
-    while (var) {
-        Variable *next = var->next;
-        free(var->value);
-        free(var);
-        var = next;
-    }
-    
-    PatternRule *rule = pattern_rules;
-    while (rule) {
-        PatternRule *next = rule->next;
-        free(rule->target_pattern);
-        free(rule->dep_pattern);
-        for (int i = 0; i < rule->cmd_count; i++) free(rule->commands[i]);
-        free(rule->commands);
-        free(rule);
-        rule = next;
+    Variable *v = variables;
+    while (v) {
+        Variable *next = v->next;
+        free(v->value);
+        free(v);
+        v = next;
     }
 }
 
@@ -1028,27 +730,17 @@ int main(int argc, char **argv) {
         return 1;
     }
     
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-j") == 0 && i+1 < argc) { jobs = atoi(argv[++i]); if (jobs < 1) jobs = 1; }
-        else if (strcmp(argv[i], "--no-color") == 0) use_color = 0;
-        else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) dry_run = 1;
+    global_flag_count = argc - 2;
+    global_flags = malloc(global_flag_count * sizeof(char*));
+    for (int i = 0; i < global_flag_count; i++) {
+        global_flags[i] = argv[i + 2];
     }
     
     parse_umkfile("UMK");
     
-    int flag_count = 0;
-    char **flags = malloc((argc - 2) * sizeof(char*));
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-j") == 0 || strcmp(argv[i], "--no-color") == 0 ||
-            strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) {
-            if (strcmp(argv[i], "-j") == 0) i++;
-            continue;
-        }
-        flags[flag_count++] = argv[i];
-    }
+    int ret = execute(argv[1]);
     
-    int ret = execute_command(argv[1], flag_count, flags);
-    free(flags);
-    free_commands();
+    free(global_flags);
+    free_all();
     return ret;
 }
