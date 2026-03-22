@@ -87,6 +87,7 @@ Job *job_queue = NULL;
 void trim(char *str);
 int is_blank(const char *str);
 char *expand_string(const char *str, int for_dependency);
+char *expand_string_with_special(const char *str, const char *target, const char *dep, const char *all_deps);  // добавить эту строку
 ExprNode *parse_expr(const char *str);
 char *eval_expr(ExprNode *node);
 void free_expr(ExprNode *node);
@@ -957,12 +958,78 @@ int execute_command(const char *cmd_name, int flag_count, char **flags) {
         }
     }
     
+    // Собираем зависимости для специальных переменных
+    char *target = strdup(cmd_name);
+    char *first_dep = NULL;
+    char *all_deps = NULL;
+    
+    // Пытаемся найти зависимости из паттерн-правил
+    PatternRule *rule = pattern_rules;
+    while (rule) {
+        if (match_pattern(cmd_name, rule->target_pattern)) {
+            char *stem = apply_pattern(cmd_name, rule->target_pattern);
+            if (stem) {
+                char dep_pattern[MAX_LINE];
+                strcpy(dep_pattern, rule->dep_pattern);
+                
+                char *dep_result = malloc(MAX_LINE);
+                char *p = dep_pattern;
+                char *out = dep_result;
+                while (*p) {
+                    if (*p == '*' && (p == dep_pattern || *(p-1) != '$')) {
+                        strcpy(out, stem);
+                        out += strlen(stem);
+                        p++;
+                    } else if (*p == '$' && *(p+1) == '*') {
+                        strcpy(out, stem);
+                        out += strlen(stem);
+                        p += 2;
+                    } else {
+                        *out++ = *p++;
+                    }
+                }
+                *out = '\0';
+                
+                int dep_count;
+                char **deps = split_deps(dep_result, &dep_count);
+                if (dep_count > 0) {
+                    first_dep = strdup(deps[0]);
+                    
+                    // Собираем все зависимости в строку
+                    all_deps = malloc(MAX_LINE);
+                    all_deps[0] = '\0';
+                    for (int i = 0; i < dep_count; i++) {
+                        if (i > 0) strcat(all_deps, " ");
+                        strcat(all_deps, deps[i]);
+                    }
+                }
+                
+                for (int i = 0; i < dep_count; i++) free(deps[i]);
+                free(deps);
+                free(dep_result);
+                break;
+            }
+        }
+        rule = rule->next;
+    }
+    
+    // Если нет зависимостей из правил, используем пустые
+    if (!first_dep) first_dep = strdup("");
+    if (!all_deps) all_deps = strdup("");
+    
+    set_special_vars(target, first_dep, all_deps);
+    
     Flag *current = cmd->flags;
     while (current) {
         for (int i = 0; i < requested_count; i++) {
             if (requested_flags[i] == current && current->type == 0) {
                 int ret = execute_flag(current);
-                if (ret != 0) return ret;
+                if (ret != 0) {
+                    free(target);
+                    free(first_dep);
+                    free(all_deps);
+                    return ret;
+                }
                 break;
             }
         }
@@ -983,8 +1050,23 @@ int execute_command(const char *cmd_name, int flag_count, char **flags) {
     }
     
     if (need_build) {
-        ret = execute_commands(cmd->main_commands, cmd->main_cmd_count, 1);
-        if (ret != 0) return ret;
+        // Расширяем команды с учётом специальных переменных
+        char **expanded_commands = malloc(cmd->main_cmd_count * sizeof(char*));
+        for (int i = 0; i < cmd->main_cmd_count; i++) {
+            char *exp = expand_string_with_special(cmd->main_commands[i], target, first_dep, all_deps);
+            expanded_commands[i] = exp;
+        }
+        ret = execute_commands(expanded_commands, cmd->main_cmd_count, 1);
+        for (int i = 0; i < cmd->main_cmd_count; i++) {
+            free(expanded_commands[i]);
+        }
+        free(expanded_commands);
+        if (ret != 0) {
+            free(target);
+            free(first_dep);
+            free(all_deps);
+            return ret;
+        }
     }
     
     current = cmd->flags;
@@ -992,24 +1074,62 @@ int execute_command(const char *cmd_name, int flag_count, char **flags) {
         for (int i = 0; i < requested_count; i++) {
             if (requested_flags[i] == current && current->type == 1) {
                 int ret = execute_flag(current);
-                if (ret != 0) return ret;
+                if (ret != 0) {
+                    free(target);
+                    free(first_dep);
+                    free(all_deps);
+                    return ret;
+                }
                 break;
             }
         }
         current = current->next;
     }
     
-    PatternRule *rule = pattern_rules;
-    while (rule) {
-        if (match_pattern(cmd_name, rule->target_pattern)) {
-            if (execute_pattern_rule(cmd_name, rule) != 0) {
-                return 1;
-            }
-        }
-        rule = rule->next;
-    }
+    free(target);
+    free(first_dep);
+    free(all_deps);
     
     return 0;
+}
+
+char *expand_string_with_special(const char *str, const char *target, const char *dep, const char *all_deps) {
+    static char result[MAX_LINE];
+    result[0] = '\0';
+    
+    const char *p = str;
+    while (*p) {
+        if (*p == '$' && *(p+1) == '@') {
+            strcat(result, target);
+            p += 2;
+        } else if (*p == '$' && *(p+1) == '<') {
+            strcat(result, dep);
+            p += 2;
+        } else if (*p == '$' && *(p+1) == '^') {
+            strcat(result, all_deps);
+            p += 2;
+        } else if (*p == '$' && *(p+1) == '(') {
+            ExprNode *expr = parse_expr(p);
+            char *val = eval_expr(expr);
+            strcat(result, val);
+            
+            int depth = 1;
+            p += 2;
+            while (*p && depth > 0) {
+                if (*p == '(') depth++;
+                else if (*p == ')') depth--;
+                p++;
+            }
+            
+            free_expr(expr);
+        } else {
+            char ch[2] = {*p, '\0'};
+            strcat(result, ch);
+            p++;
+        }
+    }
+    
+    return result;
 }
 
 void free_commands() {

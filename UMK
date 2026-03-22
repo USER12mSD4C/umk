@@ -1,34 +1,124 @@
+# ==================== ПЕРЕМЕННЫЕ ====================
 CC = gcc
-CFLAGS = -Wall
+CFLAGS = -Wall -Wextra
+DEBUG = 0
+LIBS = -lm
 
-# Шаблон для .o файлов
-%.o: %.c
-    $(CC) $(CFLAGS) -c $< -o $@
+# Встроенные функции
+SRCS = $(wildcard *.c)
+DATE = $(shell date)
+USER = $(shell whoami)
 
-# Условная компиляция
+# ==================== УСЛОВИЯ ====================
 if $(DEBUG) == 1
     CFLAGS = -g -O0
 else
     CFLAGS = -O2
 endif
 
+# ==================== КОМАНДА BUILD ====================
 build:
-    echo "Building with $(CFLAGS)"
-    echo "Special vars test: target=$@"
+    echo "=== BUILD START ==="
+    echo "Date: $(DATE)"
+    echo "User: $(USER)"
+    echo "Source files: $(SRCS)"
+    echo "Compiler: $(CC)"
+    echo "Flags: $(CFLAGS)"
+    echo "Libraries: $(LIBS)"
+    echo "Debug mode: $(DEBUG)"
+    echo "=== BUILD DONE ==="
     +flags:
         -fg(preclean):
-            echo "Preclean"
+            echo "[BEFORE] Cleaning old files..."
+            echo "[BEFORE] Removing *.o"
         eofg
         +fg(postclean):
-            echo "Postclean"
+            echo "[AFTER] Build finished successfully!"
+            echo "[AFTER] Total files: $(SRCS)"
+        eofg
+        -fg(verbose):
+            echo "[VERBOSE] Enabling verbose output"
+            echo "[VERBOSE] CFLAGS=$(CFLAGS)"
+            echo "[VERBOSE] LIBS=$(LIBS)"
+        eofg
+        +fg(notify):
+            echo "[NOTIFY] Build completed at $(DATE)"
+            echo "[NOTIFY] User: $(USER)"
         eofg
     ;
 eoc
 
-clean:
-    echo "Cleaning"
+# ==================== ПАТТЕРН-ПРАВИЛА ====================
+%.o: %.c
+    echo "Compiling $< -> $@"
+    echo "  CC = $(CC)"
+    echo "  CFLAGS = $(CFLAGS)"
 eoc
 
-test:
-    echo "Testing"
+# ==================== КОМАНДА TEST (файлы) ====================
+test: main.o helper.o utils.o
+    echo "=== LINKING ==="
+    echo "Linking: $^"
+    echo "Target: $@"
+    echo "First dependency: $<"
+eoc
+
+# ==================== КОМАНДА CLEAN ====================
+clean:
+    echo "Cleaning up..."
+    echo "Removing *.o files"
+eoc
+
+# ==================== КОМАНДА DISTCLEAN ====================
+distclean: clean
+    echo "Deep cleaning..."
+    echo "Removing all generated files"
+eoc
+
+# ==================== КОМАНДА INFO (shell + wildcard) ====================
+info:
+    echo "=== SYSTEM INFO ==="
+    echo "Current directory: $(shell pwd)"
+    echo "C files: $(wildcard *.c)"
+    echo "Header files: $(wildcard *.h)"
+    echo "All files: $(wildcard *)"
+    echo "=== END ==="
+    +flags:
+        -fg(verbose):
+            echo "[INFO] Detailed mode"
+            echo "[INFO] Date: $(DATE)"
+            echo "[INFO] User: $(USER)"
+        eofg
+    ;
+eoc
+
+# ==================== КОМАНДА MULTI ====================
+multi: info test clean
+    echo "=== MULTI COMMAND ==="
+    echo "Executed: info -> test -> clean"
+eoc
+
+# ==================== КОМАНДА ERROR (для проверки остановки) ====================
+error:
+    echo "Starting..."
+    echo "This will fail"
+    false
+    echo "This should NOT run"
+eoc
+
+# ==================== КОМАНДА PARALLEL (для -j) ====================
+parallel:
+    echo "Job 1: sleeping 1s"
+    sleep 1
+    echo "Job 2: sleeping 1s"
+    sleep 1
+    echo "Job 3: sleeping 1s"
+    sleep 1
+    echo "All jobs done"
+eoc
+
+# ==================== КОМАНДА PHONY (всегда выполняется) ====================
+phony:
+    echo "This is phony target"
+    echo "Always runs"
 eoc
