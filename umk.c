@@ -700,8 +700,21 @@ int execute_commands(char **cmds, int cmd_count) {
 int execute_flag(Flag *flag) {
     for (int i = 0; i < flag->cmd_count; i++) {
         char *expanded = expand_string(flag->commands[i]);
-        int ret = execute_single_command(expanded);
-        if (ret != 0) return ret;
+        
+        // Проверяем, начинается ли строка с "call "
+        char clean_line[MAX_LINE];
+        strcpy(clean_line, expanded);
+        trim(clean_line);
+        
+        if (strncmp(clean_line, "call ", 5) == 0) {
+            char *target = clean_line + 5;
+            trim(target);
+            int ret = execute_target(target);
+            if (ret != 0) return ret;
+        } else {
+            int ret = execute_single_command(clean_line);
+            if (ret != 0) return ret;
+        }
     }
     return 0;
 }
