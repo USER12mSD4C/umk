@@ -23,7 +23,7 @@ A lightweight build system with clean syntax, designed as a simpler alternative 
 
 Create a `UMK` file in your project:
 
-++==++
+```
 # Variables
 CC = gcc
 CFLAGS = -Wall -Wextra
@@ -54,58 +54,58 @@ eoc
 clean:
     rm -f *.o app
 eoc
-++==++
+```
 
 Run:
 
-++==++
+```
 umk build          # build the project
 umk build --clean  # clean and rebuild
 umk build -j 4     # parallel build
 umk clean          # clean generated files
 umk -n build       # dry-run
-++==++
+```
 
 ## Installation
 
 ### From source
 
-++==++
+```
 git clone https://github.com/USER12mSD4C/umk
 cd umk
 make
 sudo make install
-++==++
+```
 
 ### From AUR (Arch Linux)
 
-++==++
+```
 yay -S umk
 # or
 paru -S umk
-++==++
+```
 
 ### Manual
 
-++==++
+```
 gcc -O2 -Wall -Wextra -o umk umk.c
 sudo cp umk /usr/local/bin/
-++==++
+```
 
 ## Syntax Reference
 
 ### Variables
 
-++==++
+```
 CC = gcc
 CFLAGS = -Wall
 SRCS = $(wildcard *.c)
 OBJS = $(SRCS:.c=.o)
-++==++
+```
 
 ### Pattern Rules
 
-++==++
+```
 # Basic
 %.o: %.c
     $(CC) $(CFLAGS) -c -o $@ $<
@@ -120,21 +120,21 @@ eoc
 drivers/%.o: drivers/%.c
     $(CC) $(CFLAGS) -c -o $@ $<
 eoc
-++==++
+```
 
 ### Conditionals
 
-++==++
+```
 if $(DEBUG) == 1
     CFLAGS = -g -O0
 else
     CFLAGS = -O2
 endif
-++==++
+```
 
 ### Commands with Flags
 
-++==++
+```
 build:
     echo "Building..."
     +flags:
@@ -146,23 +146,23 @@ build:
         eofg
     ;
 eoc
-++==++
+```
 
 Run with flags:
 
-++==++
+```
 umk build --preclean --postclean
-++==++
+```
 
 ### Calling Targets
 
-++==++
+```
 build:
     call kernel.bin
     call kom
     echo "All done"
 eoc
-++==++
+```
 
 ### Special Variables
 
@@ -189,7 +189,7 @@ eoc
 
 ## Example: Full C Project
 
-++==++
+```
 CC = gcc
 CFLAGS = -Wall -Wextra -O2
 
@@ -212,11 +212,11 @@ eoc
 clean:
     rm -f *.o app
 eoc
-++==++
+```
 
 ## Example: Operating System Project
 
-++==++
+```
 AS = nasm
 CC = gcc
 LD = ld
@@ -259,7 +259,7 @@ eoc
 clean:
     rm -rf *.o */*.o *.bin
 eoc
-++==++
+```
 
 ## License
 
