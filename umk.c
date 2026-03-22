@@ -706,16 +706,62 @@ int execute_flag(Flag *flag) {
     return 0;
 }
 
+char *expand_rule_command(const char *cmd, const char *target, char **deps, int dep_count) {
+    static char result[MAX_LINE];
+    result[0] = '\0';
+    
+    // Собираем все зависимости в строку
+    char all_deps[MAX_LINE];
+    all_deps[0] = '\0';
+    for (int i = 0; i < dep_count; i++) {
+        if (i > 0) strcat(all_deps, " ");
+        strcat(all_deps, deps[i]);
+    }
+    
+    const char *p = cmd;
+    while (*p) {
+        if (*p == '$' && *(p+1) == '@') {
+            strcat(result, target);
+            p += 2;
+        } else if (*p == '$' && *(p+1) == '<') {
+            if (dep_count > 0) {
+                strcat(result, deps[0]);
+            }
+            p += 2;
+        } else if (*p == '$' && *(p+1) == '^') {
+            strcat(result, all_deps);
+            p += 2;
+        } else if (*p == '$' && *(p+1) == '(') {
+            const char *end = strchr(p, ')');
+            if (!end) {
+                char ch[2] = {*p, '\0'};
+                strcat(result, ch);
+                p++;
+                continue;
+            }
+            
+            char *inner = malloc(end - p - 1);
+            strncpy(inner, p + 2, end - p - 2);
+            inner[end - p - 2] = '\0';
+            
+            char *val = get_variable(inner);
+            if (val) strcat(result, val);
+            else strcat(result, inner);
+            
+            free(inner);
+            p = end + 1;
+        } else {
+            char ch[2] = {*p, '\0'};
+            strcat(result, ch);
+            p++;
+        }
+    }
+    
+    return result;
+}
+
 int execute_pattern_rule(const char *target, PatternRule *rule) {
-    if (!target || strlen(target) == 0) return 0;
-    
-    char clean_target[MAX_LINE];
-    strcpy(clean_target, target);
-    trim(clean_target);
-    
-    if (strlen(clean_target) == 0) return 0;
-    
-    char *stem = apply_pattern(clean_target, rule->target_pattern);
+    char *stem = apply_pattern(target, rule->target_pattern);
     if (!stem) return 0;
     
     char *dep_pattern_expanded = expand_dep_pattern(rule->dep_pattern, stem);
@@ -723,42 +769,40 @@ int execute_pattern_rule(const char *target, PatternRule *rule) {
     int dep_count;
     char **deps = split_deps(dep_pattern_expanded, &dep_count);
     
-    // Компилируем зависимости рекурсивно
+    // Сначала компилируем зависимости
     for (int i = 0; i < dep_count; i++) {
         PatternRule *dep_rule = find_pattern_rule(deps[i]);
         if (dep_rule) {
             int ret = execute_pattern_rule(deps[i], dep_rule);
-            if (ret != 0) return ret;
-        } else {
-            Command *cmd = find_command(deps[i]);
-            if (cmd && cmd->is_rule) {
-                int ret = execute_target(deps[i]);
-                if (ret != 0) return ret;
+            if (ret != 0) {
+                for (int j = 0; j < dep_count; j++) free(deps[j]);
+                free(deps);
+                return ret;
             }
         }
     }
     
+    // Проверяем, нужно ли пересобирать
     if (!needs_rebuild(target, deps, dep_count) && !dry_run) {
         for (int i = 0; i < dep_count; i++) free(deps[i]);
         free(deps);
         return 0;
     }
     
-    set_special_vars(target, dep_count > 0 ? deps[0] : "", dep_pattern_expanded);
-    
-    int ret = 0;
+    // Выполняем команды с подстановкой $@, $<, $^
     for (int i = 0; i < rule->cmd_count; i++) {
-        char *expanded = expand_string_with_special(rule->commands[i], target, 
-                                                     dep_count > 0 ? deps[0] : "", dep_pattern_expanded);
-        if (execute_single_command(expanded) != 0) {
-            ret = 1;
-            break;
+        char *expanded = expand_rule_command(rule->commands[i], target, deps, dep_count);
+        int ret = execute_single_command(expanded);
+        if (ret != 0) {
+            for (int j = 0; j < dep_count; j++) free(deps[j]);
+            free(deps);
+            return ret;
         }
     }
     
     for (int i = 0; i < dep_count; i++) free(deps[i]);
     free(deps);
-    return ret;
+    return 0;
 }
 
 int execute_target(const char *target_name) {
