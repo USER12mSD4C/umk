@@ -1,6 +1,8 @@
 # ==============================================
-# Тестовый UMK файл (без создания файлов)
+# Тестовый UMK файл (с табуляциями и eoc)
 # ==============================================
+
+threadreap -8
 
 # Переменные
 MSG = Hello from variable!
@@ -12,6 +14,26 @@ test_vars:
 	echo "MSG = $(MSG)"
 	echo "WILD_SRC = $(WILD_SRC)"
 	echo "SHELL_DATE = $(SHELL_DATE)"
+eoc
+
+jtest: task1 task2 task3 task4
+	echo "done"
+eoc
+
+task1:
+	echo "module0/"
+eoc
+task2:
+	sleep 3
+	echo "module3/"
+eoc
+task3:
+	sleep 1
+	echo "module1/"
+eoc
+task4:
+	sleep 4
+	echo "module4/"
 eoc
 
 # 2. Проверка цепочки зависимостей (виртуальные цели)
@@ -27,22 +49,18 @@ test_deps: dep1 dep2
 	echo "test_deps finished"
 eoc
 
-# 3. Автоматические переменные (работают в контексте правил)
-# Для их проверки нужны "реальные" файлы, но мы обойдёмся без создания:
-# Используем существующие файлы (например сам UMK) как зависимости.
+# 3. Автоматические переменные
 test_autovars: UMK Makefile
 	echo "Target: $@"
 	echo "First dep: $<"
 	echo "All deps: $^"
 eoc
 
-# 4. Шаблонное правило (без создания файлов)
-# Просто печатает, что должно было бы произойти.
+# 4. Шаблонное правило
 %.fake: %.src
 	echo "Pattern rule triggered: target=$@, source=$<"
 eoc
 
-# Подготовим файл-источник (без реального создания, просто echo)
 dummy.src:
 	echo "This is dummy.src content (simulated)"
 eoc
@@ -56,23 +74,24 @@ test_call:
 	echo "This is a command"
 	call test_vars
 eoc
+
 flag:
-    echo "shi its message"
-    +flags:
-    -fg(before_flag)
-	    echo "Before command flag executed"
-    eofg
-    +fg(after_flag)
-	    echo "After command flag executed"
-    eofg
-    ;
+	echo "shi its message"
+	+flags:
+	-fg(before_flag)
+		echo "Before command flag executed"
+	eofg
+	+fg(after_flag)
+		echo "After command flag executed"
+	eofg
+	;
 eoc
 
 test_flags:
 	echo "Main command of test_flags"
 eoc
 
-# 6. Цель по умолчанию (запустит все проверки)
+# 6. Цель по умолчанию
 all: test_vars test_deps test_autovars test_pattern test_call test_flags
 	echo "All tests passed!"
 eoc
