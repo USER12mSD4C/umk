@@ -7,7 +7,6 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <errno.h>
 
 #define MAX_LINE 4096
 #define MAX_NAME 256
@@ -17,27 +16,57 @@
 #define COLOR_YELLOW  "\033[33m"
 #define COLOR_RESET   "\033[0m"
 
+/* ---------- Dynamic string array helpers ---------- */
+typedef struct {
+    char **items;
+    int count;
+    int capacity;
+} StrVec;
+
+static void strvec_init(StrVec *v) {
+    v->items = NULL;
+    v->count = 0;
+    v->capacity = 0;
+}
+
+static void strvec_add(StrVec *v, const char *str) {
+    if (v->count >= v->capacity) {
+        v->capacity = v->capacity ? v->capacity * 2 : 4;
+        v->items = realloc(v->items, v->capacity * sizeof(char*));
+        if (!v->items) { perror("realloc"); exit(1); }
+    }
+    v->items[v->count++] = strdup(str);
+}
+
+static void strvec_free(StrVec *v) {
+    for (int i = 0; i < v->count; i++) free(v->items[i]);
+    free(v->items);
+    strvec_init(v);
+}
+
+static void strvec_clear(StrVec *v) {
+    for (int i = 0; i < v->count; i++) free(v->items[i]);
+    v->count = 0;
+}
+
+/* ---------- Data structures ---------- */
 typedef struct Flag {
     char name[MAX_NAME];
-    int type;
-    char **commands;
-    int cmd_count;
+    int type;              // 0 = before, 1 = after
+    StrVec commands;
     struct Flag *next;
 } Flag;
 
 typedef struct Rule {
     char *target;
-    char **deps;
-    int dep_cnt;
-    char **commands;
-    int cmd_cnt;
+    StrVec deps;
+    StrVec commands;
     struct Rule *next;
 } Rule;
 
 typedef struct Command {
     char name[MAX_NAME];
-    char **commands;
-    int cmd_count;
+    StrVec commands;
     Flag *flags;
     struct Command *next;
 } Command;
@@ -48,6 +77,7 @@ typedef struct Variable {
     struct Variable *next;
 } Variable;
 
+/* ---------- Globals ---------- */
 Rule *rules = NULL;
 Command *commands = NULL;
 Variable *variables = NULL;
@@ -56,42 +86,38 @@ int global_flag_count = 0;
 int use_color = 1;
 int dry_run = 0;
 
+/* ---------- Forward declarations ---------- */
 void trim(char *str);
 int is_blank(const char *str);
 char *expand(const char *str);
 void add_variable(const char *name, const char *value);
 char *get_variable(const char *name);
-void add_rule(const char *target, const char *deps, const char *cmd);
-void add_command(const char *name);
-void add_command_line(Command *cmd, const char *line);
-void add_flag(Command *cmd, const char *flag_line);
-void add_flag_command(Flag *flag, const char *line);
 void parse_umkfile(const char *filename);
 int execute(const char *target);
 int execute_shell(const char *cmd);
-int needs_rebuild(const char *target, char **deps, int dep_cnt);
+int needs_rebuild(const char *target, StrVec *deps);
 time_t get_mtime(const char *path);
 int match_pattern(const char *name, const char *pattern);
 char *apply_pattern(const char *target, const char *pattern);
-char **split(const char *str, int *cnt);
 char *wildcard(const char *pattern);
 char *shell_cmd(const char *cmd);
 void print_color(const char *color, const char *msg);
 void free_all(void);
+static int exec_command_list(StrVec *cmds);
+static Flag *parse_flag_line(const char *line);
 
+/* ---------- Utility functions ---------- */
 time_t get_mtime(const char *path) {
     struct stat st;
-    if (stat(path, &st) == 0) return st.st_mtime;
-    return 0;
+    return stat(path, &st) == 0 ? st.st_mtime : 0;
 }
 
-int needs_rebuild(const char *target, char **deps, int dep_cnt) {
+int needs_rebuild(const char *target, StrVec *deps) {
     time_t t = get_mtime(target);
     if (t == 0) return 1;
-    for (int i = 0; i < dep_cnt; i++) {
-        time_t d = get_mtime(deps[i]);
-        if (d == 0) return 1;
-        if (d > t) return 1;
+    for (int i = 0; i < deps->count; i++) {
+        time_t d = get_mtime(deps->items[i]);
+        if (d == 0 || d > t) return 1;
     }
     return 0;
 }
@@ -112,19 +138,19 @@ int is_blank(const char *str) {
 }
 
 void print_color(const char *color, const char *msg) {
-    if (use_color && isatty(2)) fprintf(stderr, "%s%s%s\n", color, msg, COLOR_RESET);
-    else fprintf(stderr, "%s\n", msg);
+    if (use_color && isatty(2))
+        fprintf(stderr, "%s%s%s\n", color, msg, COLOR_RESET);
+    else
+        fprintf(stderr, "%s\n", msg);
 }
 
 void add_variable(const char *name, const char *value) {
-    Variable *v = variables;
-    while (v) {
+    for (Variable *v = variables; v; v = v->next) {
         if (strcmp(v->name, name) == 0) {
             free(v->value);
             v->value = strdup(value);
             return;
         }
-        v = v->next;
     }
     Variable *nv = malloc(sizeof(Variable));
     strcpy(nv->name, name);
@@ -134,11 +160,8 @@ void add_variable(const char *name, const char *value) {
 }
 
 char *get_variable(const char *name) {
-    Variable *v = variables;
-    while (v) {
+    for (Variable *v = variables; v; v = v->next)
         if (strcmp(v->name, name) == 0) return v->value;
-        v = v->next;
-    }
     return NULL;
 }
 
@@ -177,7 +200,7 @@ int match_pattern(const char *name, const char *pattern) {
     char p[MAX_LINE];
     strcpy(p, pattern);
     for (char *x = p; *x; x++) if (*x == '%') *x = '*';
-    
+
     const char *pp = p, *nn = name;
     while (*pp) {
         if (*pp == '*') {
@@ -201,37 +224,20 @@ char *apply_pattern(const char *target, const char *pattern) {
     char p[MAX_LINE];
     strcpy(p, pattern);
     for (char *x = p; *x; x++) if (*x == '%') *x = '*';
-    
+
     char *star = strchr(p, '*');
     if (!star) { strcpy(res, pattern); return res; }
-    
+
     int pre = star - p;
     int suf = strlen(p) - (pre + 1);
     if (strncmp(target, p, pre) != 0) return NULL;
     int tlen = strlen(target);
     if (tlen < pre + suf) return NULL;
-    if (suf > 0) {
-        const char *s = p + pre + 1;
-        if (strcmp(target + tlen - suf, s) != 0) return NULL;
-    }
+    if (suf > 0 && strcmp(target + tlen - suf, p + pre + 1) != 0) return NULL;
+
     int stem_len = tlen - pre - suf;
     strncpy(res, target + pre, stem_len);
     res[stem_len] = 0;
-    return res;
-}
-
-char **split(const char *str, int *cnt) {
-    char *copy = strdup(str);
-    char **res = NULL;
-    *cnt = 0;
-    char *tok = strtok(copy, " ");
-    while (tok) {
-        res = realloc(res, (*cnt + 1) * sizeof(char*));
-        res[*cnt] = strdup(tok);
-        (*cnt)++;
-        tok = strtok(NULL, " ");
-    }
-    free(copy);
     return res;
 }
 
@@ -242,26 +248,24 @@ char *expand(const char *str) {
     while (*p) {
         if (*p == '$' && p[1] == '(') {
             const char *end = strchr(p, ')');
-            if (!end) { strncat(res, p, MAX_LINE - strlen(res) - 1); break; }
-            char *inner = malloc(end - p - 1);
-            strncpy(inner, p + 2, end - p - 2);
-            inner[end - p - 2] = 0;
+            if (!end) {
+                strncat(res, p, MAX_LINE - strlen(res) - 1);
+                break;
+            }
+            int len = end - p - 2;
+            char *inner = malloc(len + 1);
+            strncpy(inner, p + 2, len);
+            inner[len] = 0;
+
             char *space = strchr(inner, ' ');
             if (space) {
                 *space = 0;
                 char *func = inner;
                 char *args = space + 1;
-                int ac = 1;
-                for (char *q = args; *q; q++) if (*q == ' ') ac++;
-                const char **av = malloc(ac * sizeof(char*));
-                char *arg = strtok(args, " ");
-                int i = 0;
-                while (arg) { av[i++] = arg; arg = strtok(NULL, " "); }
-                char *val = "";
-                if (strcmp(func, "wildcard") == 0) val = wildcard(av[0]);
-                else if (strcmp(func, "shell") == 0) val = shell_cmd(av[0]);
-                strcat(res, val);
-                free(av);
+                if (strcmp(func, "wildcard") == 0)
+                    strcat(res, wildcard(args));
+                else if (strcmp(func, "shell") == 0)
+                    strcat(res, shell_cmd(args));
             } else {
                 char *val = get_variable(inner);
                 if (val) strcat(res, val);
@@ -269,79 +273,54 @@ char *expand(const char *str) {
             free(inner);
             p = end + 1;
         } else {
-            char ch[2] = {*p, 0};
-            strcat(res, ch);
+            strncat(res, p, 1);
             p++;
         }
     }
     return res;
 }
 
-void add_rule(const char *target, const char *deps, const char *cmd) {
-    Rule *r = malloc(sizeof(Rule));
-    r->target = strdup(target);
-    r->deps = split(deps, &r->dep_cnt);
-    r->commands = malloc(sizeof(char*));
-    r->commands[0] = strdup(cmd);
-    r->cmd_cnt = 1;
-    r->next = rules;
-    rules = r;
-}
-
-void add_command(const char *name) {
-    Command *c = malloc(sizeof(Command));
-    strcpy(c->name, name);
-    c->commands = NULL;
-    c->cmd_count = 0;
-    c->flags = NULL;
-    c->next = commands;
-    commands = c;
-}
-
-void add_command_line(Command *cmd, const char *line) {
-    cmd->commands = realloc(cmd->commands, (cmd->cmd_count + 1) * sizeof(char*));
-    cmd->commands[cmd->cmd_count] = strdup(line);
-    cmd->cmd_count++;
-}
-
-void add_flag(Command *cmd, const char *flag_line) {
-    Flag *f = malloc(sizeof(Flag));
-    f->commands = NULL;
-    f->cmd_count = 0;
-    f->next = cmd->flags;
-    cmd->flags = f;
+/* ---------- Parsing helpers ---------- */
+static Flag *parse_flag_line(const char *line) {
     char copy[MAX_LINE];
-    strcpy(copy, flag_line);
+    strcpy(copy, line);
     trim(copy);
+    if (strncmp(copy, "-fg(", 4) != 0 && strncmp(copy, "+fg(", 4) != 0)
+        return NULL;
+
+    Flag *f = malloc(sizeof(Flag));
+    strvec_init(&f->commands);
+    f->next = NULL;
     f->type = (copy[0] == '-') ? 0 : 1;
+
     char *start = strchr(copy, '(') + 1;
     char *end = strchr(start, ')');
     int len = end - start;
     strncpy(f->name, start, len);
     f->name[len] = 0;
+    return f;
 }
 
-void add_flag_command(Flag *flag, const char *line) {
-    flag->commands = realloc(flag->commands, (flag->cmd_count + 1) * sizeof(char*));
-    flag->commands[flag->cmd_count] = strdup(line);
-    flag->cmd_count++;
-}
+/* ---------- Parse UMK file ---------- */
+void parse_umkfile(const char *filename) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        print_color(COLOR_RED, "No UMK file");
+        exit(1);
+    }
 
-void parse_umkfile(const char *file) {
-    FILE *fp = fopen(file, "r");
-    if (!fp) { print_color(COLOR_RED, "No UMK file"); exit(1); }
-    
     char line[MAX_LINE];
     Command *cur_cmd = NULL;
     Flag *cur_flag = NULL;
-    int in_flags = 0, in_flag = 0;
-    
+    int in_flags = 0;
+
     while (fgets(line, sizeof(line), fp)) {
         char orig[MAX_LINE];
         strcpy(orig, line);
         trim(line);
         if (is_blank(line)) continue;
-        
+
+        // Variable assignment
         char *eq = strchr(line, '=');
         if (eq && !in_flags && !cur_cmd) {
             *eq = 0;
@@ -350,7 +329,8 @@ void parse_umkfile(const char *file) {
             add_variable(name, expand(val));
             continue;
         }
-        
+
+        // Target definition
         char *colon = strchr(line, ':');
         if (colon && !in_flags && !cur_cmd) {
             *colon = 0;
@@ -358,124 +338,128 @@ void parse_umkfile(const char *file) {
             char *deps = colon + 1;
             trim(target);
             trim(deps);
-            
-            long pos = ftell(fp);
-            char next_line[MAX_LINE];
-            
-            if (fgets(next_line, sizeof(next_line), fp)) {
-                char trimmed_next[MAX_LINE];
-                strcpy(trimmed_next, next_line);
-                trim(trimmed_next);
-                
-                // Если есть зависимости — это правило
-                if (strlen(deps) > 0) {
-                    Rule *r = malloc(sizeof(Rule));
-                    r->target = strdup(target);
-                    char *expanded_deps = expand(deps);
-                    r->deps = split(expanded_deps, &r->dep_cnt);
-                    r->commands = NULL;
-                    r->cmd_cnt = 0;
-                    r->next = rules;
-                    rules = r;
-                    
-                    if (next_line[0] == '\t') {
-                        r->commands = realloc(r->commands, sizeof(char*));
-                        r->commands[0] = strdup(trimmed_next);
-                        r->cmd_cnt = 1;
-                    }
-                    
-                    while (fgets(line, sizeof(line), fp)) {
-                        char line_copy[MAX_LINE];
-                        strcpy(line_copy, line);
-                        trim(line_copy);
-                        if (strcmp(line_copy, "eoc") == 0) break;
-                        if (line[0] == '\t') {
-                            trim(line_copy);
-                            r->commands = realloc(r->commands, (r->cmd_cnt + 1) * sizeof(char*));
-                            r->commands[r->cmd_cnt] = strdup(line_copy);
-                            r->cmd_cnt++;
-                        }
-                    }
-                } else {
-                    add_command(target);
-                    cur_cmd = commands;
-                    fseek(fp, pos, SEEK_SET);
-                }
+
+            // Check if it's a command (no deps) or a rule
+            if (strlen(deps) == 0) {
+                // Command
+                Command *cmd = malloc(sizeof(Command));
+                strcpy(cmd->name, target);
+                strvec_init(&cmd->commands);
+                cmd->flags = NULL;
+                cmd->next = commands;
+                commands = cmd;
+                cur_cmd = cmd;
             } else {
-                add_command(target);
+                // Rule
+                Rule *r = malloc(sizeof(Rule));
+                r->target = strdup(target);
+                strvec_init(&r->deps);
+                strvec_init(&r->commands);
+
+                char *exp_deps = expand(deps);
+                char *copy = strdup(exp_deps);
+                char *tok = strtok(copy, " ");
+                while (tok) {
+                    strvec_add(&r->deps, tok);
+                    tok = strtok(NULL, " ");
+                }
+                free(copy);
+
+                // Read rule commands until "eoc"
+                if (fgets(line, sizeof(line), fp)) {
+                    char trimmed[MAX_LINE];
+                    strcpy(trimmed, line);
+                    trim(trimmed);
+                    if (line[0] == '\t')
+                        strvec_add(&r->commands, trimmed);
+                }
+                while (fgets(line, sizeof(line), fp)) {
+                    char trimmed[MAX_LINE];
+                    strcpy(trimmed, line);
+                    trim(trimmed);
+                    if (strcmp(trimmed, "eoc") == 0) break;
+                    if (line[0] == '\t')
+                        strvec_add(&r->commands, trimmed);
+                }
+                r->next = rules;
+                rules = r;
             }
             continue;
         }
-        
+
         if (strcmp(line, "eoc") == 0) {
             cur_cmd = NULL;
             in_flags = 0;
-            in_flag = 0;
+            cur_flag = NULL;
             continue;
         }
-        
+
         if (!cur_cmd) continue;
-        
+
+        // Flags section
         if (strcmp(line, "+flags:") == 0) {
             in_flags = 1;
             continue;
         }
-        
+
         if (in_flags) {
             if (strcmp(line, ";") == 0) {
                 in_flags = 0;
                 cur_flag = NULL;
                 continue;
             }
-            
-            char *trimmed = orig;
-            while (isspace(*trimmed)) trimmed++;
-            if (strncmp(trimmed, "-fg(", 4) == 0 || strncmp(trimmed, "+fg(", 4) == 0) {
-                Flag *f = malloc(sizeof(Flag));
-                f->commands = NULL;
-                f->cmd_count = 0;
-                f->next = cur_cmd->flags;
-                cur_cmd->flags = f;
-                
-                char copy[MAX_LINE];
-                strcpy(copy, trimmed);
-                trim(copy);
-                f->type = (copy[0] == '-') ? 0 : 1;
-                
-                char *start = strchr(copy, '(') + 1;
-                char *end = strchr(start, ')');
-                int len = end - start;
-                strncpy(f->name, start, len);
-                f->name[len] = 0;
-                
-                cur_flag = f;
-                in_flag = 1;
+
+            Flag *new_flag = parse_flag_line(orig);
+            if (new_flag) {
+                new_flag->next = cur_cmd->flags;
+                cur_cmd->flags = new_flag;
+                cur_flag = new_flag;
                 continue;
             }
-            
+
             if (strcmp(line, "eofg") == 0) {
                 cur_flag = NULL;
-                in_flag = 0;
                 continue;
             }
-            
-            if (in_flag && cur_flag) {
-                cur_flag->commands = realloc(cur_flag->commands, (cur_flag->cmd_count + 1) * sizeof(char*));
-                cur_flag->commands[cur_flag->cmd_count] = strdup(line);
-                cur_flag->cmd_count++;
-                continue;
-            }
+
+            if (cur_flag)
+                strvec_add(&cur_flag->commands, line);
+            continue;
         }
-        
-        if (!in_flags && line[0] != '\t') {
-            add_command_line(cur_cmd, line);
-        }
+
+        // Regular command line
+        if (line[0] != '\t')
+            strvec_add(&cur_cmd->commands, line);
     }
     fclose(fp);
 }
 
+/* ---------- Execution helpers ---------- */
+static int exec_command_list(StrVec *cmds) {
+    for (int i = 0; i < cmds->count; i++) {
+        char *exp = expand(cmds->items[i]);
+        char line[MAX_LINE];
+        strcpy(line, exp);
+        trim(line);
+
+        int ret;
+        if (strncmp(line, "call ", 5) == 0) {
+            char *target = line + 5;
+            trim(target);
+            ret = execute(target);
+        } else {
+            ret = execute_shell(line);
+        }
+        if (ret != 0) return ret;
+    }
+    return 0;
+}
+
 int execute_shell(const char *cmd) {
-    if (dry_run) { printf("%s\n", cmd); return 0; }
+    if (dry_run) {
+        printf("%s\n", cmd);
+        return 0;
+    }
     printf("%s\n", cmd);
     fflush(stdout);
     int ret = system(cmd);
@@ -483,238 +467,174 @@ int execute_shell(const char *cmd) {
         char msg[MAX_LINE];
         snprintf(msg, sizeof(msg), "Error: %s (exit code: %d)", cmd, ret);
         print_color(COLOR_RED, msg);
-        return ret;
+    }
+    return ret;
+}
+
+static int exec_flags_of_type(Command *c, int type) {
+    for (Flag *f = c->flags; f; f = f->next) {
+        if (f->type != type) continue;
+        for (int i = 0; i < global_flag_count; i++) {
+            char *flag_name = global_flags[i];
+            if (flag_name[0] == '-') {
+                flag_name += (flag_name[1] == '-') ? 2 : 1;
+            }
+            if (strcmp(f->name, flag_name) == 0) {
+                int ret = exec_command_list(&f->commands);
+                if (ret != 0) return ret;
+                break;
+            }
+        }
     }
     return 0;
 }
 
+/* ---------- Main execution ---------- */
 int execute(const char *target_name) {
     char clean[MAX_LINE];
     strcpy(clean, target_name);
     trim(clean);
     if (strlen(clean) == 0) return 0;
-    
-    // Ищем команду
-    Command *c = commands;
-    while (c) {
-        if (strcmp(c->name, clean) == 0) break;
-        c = c->next;
+
+    // Try as a command
+    for (Command *c = commands; c; c = c->next) {
+        if (strcmp(c->name, clean) != 0) continue;
+
+        int ret = exec_flags_of_type(c, 0); // BEFORE flags
+        if (ret != 0) return ret;
+
+        ret = exec_command_list(&c->commands);
+        if (ret != 0) return ret;
+
+        ret = exec_flags_of_type(c, 1); // AFTER flags
+        return ret;
     }
-    
-    if (c) {
-        // BEFORE flags
-        Flag *f = c->flags;
-        while (f) {
-            for (int i = 0; i < global_flag_count; i++) {
-                char *flag_name = global_flags[i];
-                if (flag_name[0] == '-') {
-                    if (flag_name[1] == '-') flag_name += 2;
-                    else flag_name += 1;
-                }
-                if (strcmp(f->name, flag_name) == 0 && f->type == 0) {
-                    for (int j = 0; j < f->cmd_count; j++) {
-                        char *exp = expand(f->commands[j]);
-                        char line[MAX_LINE];
-                        strcpy(line, exp);
-                        trim(line);
-                        if (strncmp(line, "call ", 5) == 0) {
-                            char *target = line + 5;
-                            trim(target);
-                            int ret = execute(target);
-                            if (ret != 0) return ret;
-                        } else {
-                            int ret = execute_shell(line);
-                            if (ret != 0) return ret;
-                        }
-                    }
-                }
-            }
-            f = f->next;
-        }
-        
-        // Основные команды
-        for (int i = 0; i < c->cmd_count; i++) {
-            char *exp = expand(c->commands[i]);
-            char line[MAX_LINE];
-            strcpy(line, exp);
-            trim(line);
-            if (strncmp(line, "call ", 5) == 0) {
-                char *target = line + 5;
-                trim(target);
-                int ret = execute(target);
-                if (ret != 0) return ret;
-            } else {
-                int ret = execute_shell(line);
-                if (ret != 0) return ret;
-            }
-        }
-        
-        // AFTER flags
-        f = c->flags;
-        while (f) {
-            for (int i = 0; i < global_flag_count; i++) {
-                char *flag_name = global_flags[i];
-                if (flag_name[0] == '-') {
-                    if (flag_name[1] == '-') flag_name += 2;
-                    else flag_name += 1;
-                }
-                if (strcmp(f->name, flag_name) == 0 && f->type == 1) {
-                    for (int j = 0; j < f->cmd_count; j++) {
-                        char *exp = expand(f->commands[j]);
-                        char line[MAX_LINE];
-                        strcpy(line, exp);
-                        trim(line);
-                        if (strncmp(line, "call ", 5) == 0) {
-                            char *target = line + 5;
-                            trim(target);
-                            int ret = execute(target);
-                            if (ret != 0) return ret;
-                        } else {
-                            int ret = execute_shell(line);
-                            if (ret != 0) return ret;
-                        }
-                    }
-                }
-            }
-            f = f->next;
-        }
-        return 0;
-    }
-    
-    // Ищем правило
-    Rule *r = rules;
-    while (r) {
-        if (match_pattern(clean, r->target)) break;
-        r = r->next;
-    }
-    
-    if (r) {
-        char **deps_exp = NULL;
-        int dep_cnt = 0;
-        
+
+    // Try as a rule
+    for (Rule *r = rules; r; r = r->next) {
+        if (!match_pattern(clean, r->target)) continue;
+
+        StrVec actual_deps;
+        strvec_init(&actual_deps);
+
         if (strchr(r->target, '%')) {
             char *stem = apply_pattern(clean, r->target);
             if (stem) {
-                for (int i = 0; i < r->dep_cnt; i++) {
+                for (int i = 0; i < r->deps.count; i++) {
                     char buf[MAX_LINE];
-                    strcpy(buf, r->deps[i]);
-                    char res[MAX_LINE];
-                    res[0] = 0;
-                    char *p = buf;
-                    while (*p) {
+                    strcpy(buf, r->deps.items[i]);
+                    char res[MAX_LINE] = "";
+                    int res_len = 0;
+                    for (char *p = buf; *p; p++) {
                         if (*p == '%') {
-                            strcat(res, stem);
-                            p++;
+                            strcpy(res + res_len, stem);
+                            res_len += strlen(stem);
                         } else {
-                            char ch[2] = {*p, 0};
-                            strcat(res, ch);
-                            p++;
+                            res[res_len++] = *p;
+                            res[res_len] = '\0';
                         }
                     }
-                    deps_exp = realloc(deps_exp, (dep_cnt + 1) * sizeof(char*));
-                    deps_exp[dep_cnt] = strdup(res);
-                    dep_cnt++;
+                    strvec_add(&actual_deps, res);
                 }
             }
         } else {
-            deps_exp = r->deps;
-            dep_cnt = r->dep_cnt;
+            for (int i = 0; i < r->deps.count; i++)
+                strvec_add(&actual_deps, r->deps.items[i]);
         }
-        
-        for (int i = 0; i < dep_cnt; i++) {
-            int ret = execute(deps_exp[i]);
-            if (ret != 0) return ret;
-        }
-        
-        if (!needs_rebuild(clean, deps_exp, dep_cnt) && dry_run == 0) {
-            if (deps_exp != r->deps) {
-                for (int i = 0; i < dep_cnt; i++) free(deps_exp[i]);
-                free(deps_exp);
+
+        // Build dependencies
+        for (int i = 0; i < actual_deps.count; i++) {
+            int ret = execute(actual_deps.items[i]);
+            if (ret != 0) {
+                strvec_free(&actual_deps);
+                return ret;
             }
+        }
+
+        if (!needs_rebuild(clean, &actual_deps) && !dry_run) {
+            strvec_free(&actual_deps);
             return 0;
         }
-        
-        for (int i = 0; i < r->cmd_cnt; i++) {
-            char cmd_buf[MAX_LINE];
-            strcpy(cmd_buf, r->commands[i]);
-            char res[MAX_LINE];
-            res[0] = 0;
-            char *p = cmd_buf;
-            while (*p) {
+
+        // Execute rule commands with automatic variables
+        for (int i = 0; i < r->commands.count; i++) {
+            char res[MAX_LINE] = "";
+            int res_len = 0;
+            char *cmd = r->commands.items[i];
+            for (char *p = cmd; *p; p++) {
                 if (*p == '$' && p[1] == '@') {
-                    strcat(res, clean);
-                    p += 2;
-                } else if (*p == '$' && p[1] == '<') {
-                    if (dep_cnt > 0) strcat(res, deps_exp[0]);
-                    p += 2;
-                } else if (*p == '$' && p[1] == '^') {
-                    for (int j = 0; j < dep_cnt; j++) {
-                        if (j > 0) strcat(res, " ");
-                        strcat(res, deps_exp[j]);
-                    }
-                    p += 2;
-                } else {
-                    char ch[2] = {*p, 0};
-                    strcat(res, ch);
+                    strcpy(res + res_len, clean);
+                    res_len += strlen(clean);
                     p++;
+                } else if (*p == '$' && p[1] == '<') {
+                    if (actual_deps.count > 0) {
+                        strcpy(res + res_len, actual_deps.items[0]);
+                        res_len += strlen(actual_deps.items[0]);
+                    }
+                    p++;
+                } else if (*p == '$' && p[1] == '^') {
+                    for (int j = 0; j < actual_deps.count; j++) {
+                        if (j > 0) {
+                            res[res_len++] = ' ';
+                            res[res_len] = '\0';
+                        }
+                        strcpy(res + res_len, actual_deps.items[j]);
+                        res_len += strlen(actual_deps.items[j]);
+                    }
+                    p++;
+                } else {
+                    res[res_len++] = *p;
+                    res[res_len] = '\0';
                 }
             }
             char *exp = expand(res);
             int ret = execute_shell(exp);
             if (ret != 0) {
-                if (deps_exp != r->deps) {
-                    for (int j = 0; j < dep_cnt; j++) free(deps_exp[j]);
-                    free(deps_exp);
-                }
+                strvec_free(&actual_deps);
                 return ret;
             }
         }
-        
-        if (deps_exp != r->deps) {
-            for (int i = 0; i < dep_cnt; i++) free(deps_exp[i]);
-            free(deps_exp);
-        }
+
+        strvec_free(&actual_deps);
         return 0;
     }
-    
+
+    // Target exists as a file
     if (get_mtime(clean) != 0) return 0;
-    
+
     char msg[MAX_LINE];
     snprintf(msg, sizeof(msg), "Unknown target: %s", clean);
     print_color(COLOR_RED, msg);
     return 1;
 }
 
+/* ---------- Cleanup ---------- */
 void free_all(void) {
     Rule *r = rules;
     while (r) {
         Rule *next = r->next;
         free(r->target);
-        for (int i = 0; i < r->dep_cnt; i++) free(r->deps[i]);
-        free(r->deps);
-        for (int i = 0; i < r->cmd_cnt; i++) free(r->commands[i]);
-        free(r->commands);
+        strvec_free(&r->deps);
+        strvec_free(&r->commands);
         free(r);
         r = next;
     }
-    
+
     Command *c = commands;
     while (c) {
         Command *next = c->next;
-        for (int i = 0; i < c->cmd_count; i++) free(c->commands[i]);
-        free(c->commands);
+        strvec_free(&c->commands);
         Flag *f = c->flags;
         while (f) {
             Flag *nextf = f->next;
-            for (int i = 0; i < f->cmd_count; i++) free(f->commands[i]);
-            free(f->commands);
+            strvec_free(&f->commands);
             free(f);
             f = nextf;
         }
         free(c);
         c = next;
     }
-    
+
     Variable *v = variables;
     while (v) {
         Variable *next = v->next;
@@ -724,22 +644,22 @@ void free_all(void) {
     }
 }
 
+/* ---------- Main ---------- */
 int main(int argc, char **argv) {
     if (argc < 2) {
         print_color(COLOR_YELLOW, "Usage: umk <command> [flags...]");
         return 1;
     }
-    
+
     global_flag_count = argc - 2;
     global_flags = malloc(global_flag_count * sizeof(char*));
-    for (int i = 0; i < global_flag_count; i++) {
+    for (int i = 0; i < global_flag_count; i++)
         global_flags[i] = argv[i + 2];
-    }
-    
+
     parse_umkfile("UMK");
-    
+
     int ret = execute(argv[1]);
-    
+
     free(global_flags);
     free_all();
     return ret;
