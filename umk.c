@@ -149,7 +149,7 @@ void free_job_graph(UmkCtx *ctx);
 int run_job(UmkCtx *ctx, Job *job);
 void handle_sigint(int sig);
 char **parse_command_line(const char *cmd_line, int *argc);
-int execute_command(UmkCtx *ctx, char **argv);
+int execute_command(UmkCtx *ctx, const char *cmd_line);
 void expand_autovars(const char *cmd, const char *target, StrVec *deps, char *out, size_t out_size);
 
 unsigned long long hash_file(const char *path) {
@@ -486,19 +486,15 @@ char **parse_command_line(const char *cmd_line, int *argc) {
     return argv;
 }
 
-int execute_command(UmkCtx *ctx, char **argv) {
+int execute_command(UmkCtx *ctx, const char *cmd_line) {
     if (ctx->dry_run) {
-        for (int i = 0; argv[i]; i++) {
-            if (i > 0) printf(" ");
-            printf("%s", argv[i]);
-        }
-        printf("\n");
+        printf("%s\n", cmd_line);
         return 0;
     }
     pid_t pid = fork();
     if (pid == 0) {
-        execvp(argv[0], argv);
-        perror("execvp");
+        execl("/bin/sh", "sh", "-c", cmd_line, (char *)NULL);
+        perror("execl");
         exit(127);
     } else if (pid > 0) {
         int status;
@@ -512,16 +508,7 @@ int execute_command(UmkCtx *ctx, char **argv) {
 }
 
 int execute_shell_safe(UmkCtx *ctx, const char *cmd_line) {
-    int argc;
-    char **argv = parse_command_line(cmd_line, &argc);
-    if (!argv || argc == 0) {
-        if (argv) free(argv);
-        return 0;
-    }
-    int ret = execute_command(ctx, argv);
-    for (int i = 0; i < argc; i++) free(argv[i]);
-    free(argv);
-    return ret;
+    return execute_command(ctx, cmd_line);
 }
 
 void expand_autovars(const char *cmd, const char *target, StrVec *deps, char *out, size_t out_size) {
@@ -585,6 +572,7 @@ void parse_umkfile(UmkCtx *ctx, const char *filename) {
         strcpy(orig, line);
         trim(line);
         if (is_blank(line)) continue;
+        if (line[0] == '#') continue;
         if (strncmp(line, "threadreap", 10) == 0) {
             char *p = line + 10;
             while (isspace((unsigned char)*p)) p++;
@@ -634,7 +622,9 @@ void parse_umkfile(UmkCtx *ctx, const char *filename) {
                     char trimmed[MAX_LINE];
                     strcpy(trimmed, line);
                     trim(trimmed);
-                    if (line[0] == '\t') strvec_add(&r->commands, trimmed);
+                    if (trimmed[0] != '#') {
+                        if (line[0] == '\t') strvec_add(&r->commands, trimmed);
+                    }
                 }
                 while (fgets(line, sizeof(line), fp)) {
                     line_num++;
@@ -642,6 +632,7 @@ void parse_umkfile(UmkCtx *ctx, const char *filename) {
                     strcpy(trimmed, line);
                     trim(trimmed);
                     if (strcmp(trimmed, "eoc") == 0) break;
+                    if (trimmed[0] == '#') continue;
                     if (line[0] == '\t') strvec_add(&r->commands, trimmed);
                 }
                 r->next = ctx->rules;
