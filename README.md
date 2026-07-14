@@ -1,6 +1,6 @@
 # umk - Simple Build System
 
-A lightweight build system with clean syntax, designed as a simpler alternative to make for C/C++ projects.
+A lightweight, zero-dependency parallel build system with clean syntax, designed as a simpler, robust alternative to make for C/C++ and operating system projects.
 
 ## Features
 
@@ -8,13 +8,14 @@ A lightweight build system with clean syntax, designed as a simpler alternative 
 - Variables — `CC = gcc`, `CFLAGS = -Wall`
 - Pattern rules — `%.o: %.c` with paths (`kernel/%.o: kernel/%.c`)
 - Automatic wildcard — `$(wildcard *.c)` finds all source files
-- Conditionals — `if $(DEBUG) == 1` / `else` / `endif`
 - Built-in functions — `$(shell date)`, `$(wildcard *.c)`
 - Special variables — `$@` (target), `$<` (first dep), `$^` (all deps)
-- Parallel execution — `-j N`
+- Parallel execution — `-j N` and `-jN`
 - Command flags — `-fg(name)` (before), `+fg(name)` (after)
 - Call targets — `call target` to invoke other rules
-- Timestamp checking — rebuilds only when files change
+- Content hashing cache — tracks file modifications accurately by storing a 64-bit FNV-1a content hash database in `.umk_cache` instead of relying on fragile filesystem timestamps (`mtime`)
+- Strict syntax validation — immediately reports formatting violations, unclosed blocks, and out-of-context commands with precise file names and line numbers
+- Robust argument parsing — fully supports escaped backslashes (`\`), nested single quotes (`'`), and double quotes (`"`) inside command recipes
 - Colored output
 - Dry-run mode — `-n`
 - Supports complex projects with multiple directories
@@ -68,13 +69,29 @@ umk -n build       # dry-run
 
 ## Installation
 
-### From source
+### From Nix / NixOS
+
+`umk` includes standard, non-flake Nix expressions for easy integration with the Nix ecosystem.
+
+1. Build locally (creates a `result` symlink containing `./result/bin/umk`):
+   ```bash
+   nix-build
+   ```
+
+2. Add to NixOS configuration (`configuration.nix`):
+   Import the project directory directly using `callPackage` inside your system package declaration:
+   ```nix
+   environment.systemPackages = with pkgs; [
+     # ... other packages ...
+     (callPackage /path/to/umk {})
+   ];
+   ```
+
+### Manual
 
 ```
-git clone https://github.com/USER12mSD4C/umk
-cd umk
-make
-sudo make install
+gcc -O3 -Wall -Wextra -o umk umk.c
+sudo cp umk /usr/local/bin/
 ```
 
 ### From AUR (Arch Linux)
@@ -83,13 +100,6 @@ sudo make install
 yay -S umk
 # or
 paru -S umk
-```
-
-### Manual
-
-```
-gcc -O2 -Wall -Wextra -o umk umk.c
-sudo cp umk /usr/local/bin/
 ```
 
 ## Syntax Reference
@@ -183,7 +193,7 @@ eoc
 
 | Option | Description |
 |--------|-------------|
-| `-j N` | Run N jobs in parallel |
+| `-j N`, `-jN` | Run N jobs in parallel |
 | `-n, --dry-run` | Show commands without executing |
 | `--no-color` | Disable colored output |
 

@@ -1,7 +1,3 @@
-// файл: umk.c
-// Полностью рабочий параллельный сборщик с поддержкой -j, автоопределением ядер,
-// детекцией циклов, безопасным execvp и отсутствием блокировок (как в make).
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,7 +20,6 @@
 #define COLOR_YELLOW  "\033[33m"
 #define COLOR_RESET   "\033[0m"
 
-/* ---------- Dynamic string array ---------- */
 typedef struct {
     char **items;
     int count;
@@ -57,10 +52,9 @@ static void strvec_clear(StrVec *v) {
     v->count = 0;
 }
 
-/* ---------- Data structures ---------- */
 typedef struct Flag {
     char name[MAX_NAME];
-    int type;              // 0 = before, 1 = after
+    int type;
     StrVec commands;
     struct Flag *next;
 } Flag;
@@ -85,87 +79,185 @@ typedef struct Variable {
     struct Variable *next;
 } Variable;
 
-/* ---------- Job graph ---------- */
 typedef struct Job {
     char *target;
     Rule *rule;
     Command *cmd;
-    StrVec *deps;            // имена зависимостей
+    StrVec *deps;
     int deps_remaining;
-    int state;               // 0=waiting,1=running,2=done
+    int state;
     pid_t pid;
     int rebuild_needed;
     struct Job *next;
 } Job;
 
-/* ---------- Globals ---------- */
-Rule *rules = NULL;
-Command *commands = NULL;
-Variable *variables = NULL;
-char **global_flags = NULL;
-int global_flag_count = 0;
-int use_color = 1;
-int dry_run = 0;
+typedef struct CacheEntry {
+    char path[MAX_LINE];
+    unsigned long long hash;
+    struct CacheEntry *next;
+} CacheEntry;
 
-int parallel_jobs = 1;
-int parallel_auto = 0;
-int j_from_cmdline = 0;
-Job *all_jobs = NULL;
-Job **ready_queue = NULL;
-int ready_queue_size = 0;
-int ready_queue_capacity = 0;
-int jobs_running = 0;
-int build_failed = 0;
-int interrupted = 0;
+typedef struct UmkCtx {
+    Rule *rules;
+    Command *commands;
+    Variable *variables;
+    CacheEntry *cache;
+    char **global_flags;
+    int global_flag_count;
+    int use_color;
+    int dry_run;
+    int parallel_jobs;
+    int parallel_auto;
+    int j_from_cmdline;
+    Job *all_jobs;
+    Job **ready_queue;
+    int ready_queue_size;
+    int ready_queue_capacity;
+    int jobs_running;
+    int build_failed;
+    int interrupted;
+} UmkCtx;
 
-/* ---------- Forward declarations ---------- */
+static UmkCtx *active_ctx = NULL;
+
 void trim(char *str);
 int is_blank(const char *str);
-char *expand(const char *str);
-void add_variable(const char *name, const char *value);
-char *get_variable(const char *name);
-void parse_umkfile(const char *filename);
-int execute_serial(const char *target);
-int execute_parallel(const char *target);
-int execute_shell_safe(const char *cmd_line);
-int needs_rebuild(const char *target, StrVec *deps);
-time_t get_mtime(const char *path);
+void expand(UmkCtx *ctx, const char *str, char *out, size_t out_size);
+void add_variable(UmkCtx *ctx, const char *name, const char *value);
+char *get_variable(UmkCtx *ctx, const char *name);
+void parse_umkfile(UmkCtx *ctx, const char *filename);
+int execute_serial(UmkCtx *ctx, const char *target);
+int execute_parallel(UmkCtx *ctx, const char *target);
+int execute_shell_safe(UmkCtx *ctx, const char *cmd_line);
+int needs_rebuild(UmkCtx *ctx, const char *target, StrVec *deps);
 int match_pattern(const char *name, const char *pattern);
-char *apply_pattern(const char *target, const char *pattern);
-char *wildcard(const char *pattern);
-char *shell_cmd(const char *cmd);
-void print_color(const char *color, const char *msg);
-void free_all(void);
-static int exec_command_list(StrVec *cmds, int parallel);
+int apply_pattern(const char *target, const char *pattern, char *out, size_t out_size);
+void wildcard(const char *pattern, char *out, size_t out_size);
+void shell_cmd(const char *cmd, char *out, size_t out_size);
+void print_color(UmkCtx *ctx, const char *color, const char *msg);
+void free_all(UmkCtx *ctx);
+static int exec_command_list(UmkCtx *ctx, StrVec *cmds, int parallel);
 static Flag *parse_flag_line(const char *line);
 int get_cpu_count(void);
-Job *build_job_graph(const char *target, StrVec *path);
-void add_ready_job(Job *job);
-Job *pop_ready_job(void);
-Job *find_job_by_pid(pid_t pid);
-Job *find_job_by_target(const char *target);
-void mark_dependency_done(Job *job);
-void free_job_graph(void);
-int run_job(Job *job);
+Job *build_job_graph(UmkCtx *ctx, const char *target, StrVec *path);
+void add_ready_job(UmkCtx *ctx, Job *job);
+Job *pop_ready_job(UmkCtx *ctx);
+Job *find_job_by_pid(UmkCtx *ctx, pid_t pid);
+Job *find_job_by_target(UmkCtx *ctx, const char *target);
+void mark_dependency_done(UmkCtx *ctx, Job *job);
+void free_job_graph(UmkCtx *ctx);
+int run_job(UmkCtx *ctx, Job *job);
 void handle_sigint(int sig);
 char **parse_command_line(const char *cmd_line, int *argc);
-int execute_command(char **argv);
+int execute_command(UmkCtx *ctx, char **argv);
 void expand_autovars(const char *cmd, const char *target, StrVec *deps, char *out, size_t out_size);
 
-/* ---------- Utility functions (unchanged) ---------- */
-time_t get_mtime(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 ? st.st_mtime : 0;
+unsigned long long hash_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned long long hash = 14695981039346656037ULL;
+    unsigned char buf[4096];
+    size_t bytes;
+    while ((bytes = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < bytes; i++) {
+            hash ^= buf[i];
+            hash *= 1099511628211ULL;
+        }
+    }
+    fclose(f);
+    return hash;
 }
 
-int needs_rebuild(const char *target, StrVec *deps) {
-    time_t t = get_mtime(target);
-    if (t == 0) return 1;
-    for (int i = 0; i < deps->count; i++) {
-        time_t d = get_mtime(deps->items[i]);
-        if (d == 0 || d > t) return 1;
+void load_cache(UmkCtx *ctx) {
+    ctx->cache = NULL;
+    FILE *f = fopen(".umk_cache", "r");
+    if (!f) return;
+    char line[MAX_LINE];
+    while (fgets(line, sizeof(line), f)) {
+        trim(line);
+        if (is_blank(line)) continue;
+        char path[MAX_LINE];
+        unsigned long long hash_val;
+        if (sscanf(line, "%s %llu", path, &hash_val) == 2) {
+            CacheEntry *entry = malloc(sizeof(CacheEntry));
+            if (entry) {
+                strncpy(entry->path, path, MAX_LINE - 1);
+                entry->path[MAX_LINE - 1] = 0;
+                entry->hash = hash_val;
+                entry->next = ctx->cache;
+                ctx->cache = entry;
+            }
+        }
+    }
+    fclose(f);
+}
+
+void save_cache(UmkCtx *ctx) {
+    FILE *f = fopen(".umk_cache", "w");
+    if (!f) return;
+    CacheEntry *curr = ctx->cache;
+    while (curr) {
+        fprintf(f, "%s %llu\n", curr->path, curr->hash);
+        curr = curr->next;
+    }
+    fclose(f);
+}
+
+unsigned long long get_cached_hash(UmkCtx *ctx, const char *path) {
+    CacheEntry *curr = ctx->cache;
+    while (curr) {
+        if (strcmp(curr->path, path) == 0) return curr->hash;
+        curr = curr->next;
     }
     return 0;
+}
+
+void update_cached_hash(UmkCtx *ctx, const char *path, unsigned long long hash_val) {
+    CacheEntry *curr = ctx->cache;
+    while (curr) {
+        if (strcmp(curr->path, path) == 0) {
+            curr->hash = hash_val;
+            return;
+        }
+        curr = curr->next;
+    }
+    CacheEntry *entry = malloc(sizeof(CacheEntry));
+    if (entry) {
+        strncpy(entry->path, path, MAX_LINE - 1);
+        entry->path[MAX_LINE - 1] = 0;
+        entry->hash = hash_val;
+        entry->next = ctx->cache;
+        ctx->cache = entry;
+    }
+}
+
+int needs_rebuild(UmkCtx *ctx, const char *target, StrVec *deps) {
+    if (access(target, F_OK) != 0) return 1;
+
+    unsigned long long target_curr = hash_file(target);
+    unsigned long long target_cached = get_cached_hash(ctx, target);
+    if (target_curr == 0 || target_cached == 0 || target_curr != target_cached) {
+        return 1;
+    }
+
+    for (int i = 0; i < deps->count; i++) {
+        const char *dep = deps->items[i];
+        if (access(dep, F_OK) != 0) return 1;
+
+        unsigned long long dep_curr = hash_file(dep);
+        unsigned long long dep_cached = get_cached_hash(ctx, dep);
+        if (dep_curr == 0 || dep_cached == 0 || dep_curr != dep_cached) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void mark_rebuilt(UmkCtx *ctx, const char *target, StrVec *deps) {
+    update_cached_hash(ctx, target, hash_file(target));
+    for (int i = 0; i < deps->count; i++) {
+        update_cached_hash(ctx, deps->items[i], hash_file(deps->items[i]));
+    }
 }
 
 void trim(char *str) {
@@ -183,15 +275,15 @@ int is_blank(const char *str) {
     return 1;
 }
 
-void print_color(const char *color, const char *msg) {
-    if (use_color && isatty(STDERR_FILENO))
+void print_color(UmkCtx *ctx, const char *color, const char *msg) {
+    if (ctx->use_color && isatty(STDERR_FILENO))
         fprintf(stderr, "%s%s%s\n", color, msg, COLOR_RESET);
     else
         fprintf(stderr, "%s\n", msg);
 }
 
-void add_variable(const char *name, const char *value) {
-    for (Variable *v = variables; v; v = v->next) {
+void add_variable(UmkCtx *ctx, const char *name, const char *value) {
+    for (Variable *v = ctx->variables; v; v = v->next) {
         if (strcmp(v->name, name) == 0) {
             free(v->value);
             v->value = strdup(value);
@@ -199,64 +291,62 @@ void add_variable(const char *name, const char *value) {
         }
     }
     Variable *nv = malloc(sizeof(Variable));
-    strcpy(nv->name, name);
+    if (!nv) { perror("malloc"); exit(1); }
+    strncpy(nv->name, name, MAX_NAME - 1);
+    nv->name[MAX_NAME - 1] = 0;
     nv->value = strdup(value);
-    nv->next = variables;
-    variables = nv;
+    nv->next = ctx->variables;
+    ctx->variables = nv;
 }
 
-char *get_variable(const char *name) {
-    for (Variable *v = variables; v; v = v->next)
+char *get_variable(UmkCtx *ctx, const char *name) {
+    for (Variable *v = ctx->variables; v; v = v->next)
         if (strcmp(v->name, name) == 0) return v->value;
     return NULL;
 }
 
-char *wildcard(const char *pattern) {
-    static char res[MAX_LINE];
-    res[0] = 0;
+void wildcard(const char *pattern, char *out, size_t out_size) {
+    out[0] = 0;
     DIR *d = opendir(".");
-    if (!d) return res;
+    if (!d) return;
     struct dirent *e;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
         if (match_pattern(e->d_name, pattern)) {
-            if (strlen(res) > 0) strcat(res, " ");
-            strcat(res, e->d_name);
+            if (strlen(out) > 0) strncat(out, " ", out_size - strlen(out) - 1);
+            strncat(out, e->d_name, out_size - strlen(out) - 1);
         }
     }
     closedir(d);
-    return res;
 }
 
-char *shell_cmd(const char *cmd) {
-    static char res[MAX_LINE];
-    res[0] = 0;
+void shell_cmd(const char *cmd, char *out, size_t out_size) {
+    out[0] = 0;
     FILE *f = popen(cmd, "r");
-    if (!f) return res;
+    if (!f) return;
     char line[MAX_LINE];
     if (fgets(line, sizeof(line), f)) {
         trim(line);
-        strcpy(res, line);
+        strncat(out, line, out_size - strlen(out) - 1);
     }
     pclose(f);
-    return res;
 }
 
-int match_pattern(const char *name, const char *pattern) {
-    char p[MAX_LINE];
-    strcpy(p, pattern);
-    for (char *x = p; *x; x++) if (*x == '%') *x = '*';
-    const char *pp = p, *nn = name;
+static int match_pattern_helper(const char *name, const char *pattern) {
+    const char *pp = pattern, *nn = name;
     while (*pp) {
-        if (*pp == '*') {
+        char p_char = *pp;
+        if (p_char == '%') p_char = '*';
+
+        if (p_char == '*') {
             pp++;
             if (!*pp) return 1;
             while (*nn) {
-                if (match_pattern(nn, pp)) return 1;
+                if (match_pattern_helper(nn, pp)) return 1;
                 nn++;
             }
             return 0;
-        } else if (*pp != *nn) {
+        } else if (p_char != *nn) {
             return 0;
         }
         pp++; nn++;
@@ -264,38 +354,47 @@ int match_pattern(const char *name, const char *pattern) {
     return *nn == 0;
 }
 
-char *apply_pattern(const char *target, const char *pattern) {
-    static char res[MAX_LINE];
+int match_pattern(const char *name, const char *pattern) {
+    return match_pattern_helper(name, pattern);
+}
+
+int apply_pattern(const char *target, const char *pattern, char *out, size_t out_size) {
+    out[0] = 0;
     char p[MAX_LINE];
+    if (strlen(pattern) >= MAX_LINE) return 0;
     strcpy(p, pattern);
     for (char *x = p; *x; x++) if (*x == '%') *x = '*';
     char *star = strchr(p, '*');
-    if (!star) { strcpy(res, pattern); return res; }
+    if (!star) {
+        strncat(out, pattern, out_size - 1);
+        return 1;
+    }
     int pre = star - p;
     int suf = strlen(p) - (pre + 1);
-    if (strncmp(target, p, pre) != 0) return NULL;
+    if (strncmp(target, p, pre) != 0) return 0;
     int tlen = strlen(target);
-    if (tlen < pre + suf) return NULL;
-    if (suf > 0 && strcmp(target + tlen - suf, p + pre + 1) != 0) return NULL;
+    if (tlen < pre + suf) return 0;
+    if (suf > 0 && strcmp(target + tlen - suf, p + pre + 1) != 0) return 0;
     int stem_len = tlen - pre - suf;
-    strncpy(res, target + pre, stem_len);
-    res[stem_len] = 0;
-    return res;
+    if ((size_t)stem_len >= out_size) stem_len = out_size - 1;
+    strncpy(out, target + pre, stem_len);
+    out[stem_len] = 0;
+    return 1;
 }
 
-char *expand(const char *str) {
-    static char res[MAX_LINE];
-    res[0] = 0;
+void expand(UmkCtx *ctx, const char *str, char *out, size_t out_size) {
+    out[0] = 0;
     const char *p = str;
     while (*p) {
         if (*p == '$' && p[1] == '(') {
             const char *end = strchr(p, ')');
             if (!end) {
-                strncat(res, p, MAX_LINE - strlen(res) - 1);
+                strncat(out, p, out_size - strlen(out) - 1);
                 break;
             }
             int len = end - p - 2;
             char *inner = malloc(len + 1);
+            if (!inner) { perror("malloc"); exit(1); }
             strncpy(inner, p + 2, len);
             inner[len] = 0;
             char *space = strchr(inner, ' ');
@@ -303,64 +402,92 @@ char *expand(const char *str) {
                 *space = 0;
                 char *func = inner;
                 char *args = space + 1;
-                if (strcmp(func, "wildcard") == 0)
-                    strcat(res, wildcard(args));
-                else if (strcmp(func, "shell") == 0)
-                    strcat(res, shell_cmd(args));
+                if (strcmp(func, "wildcard") == 0) {
+                    char w_buf[MAX_LINE];
+                    wildcard(args, w_buf, sizeof(w_buf));
+                    strncat(out, w_buf, out_size - strlen(out) - 1);
+                } else if (strcmp(func, "shell") == 0) {
+                    char s_buf[MAX_LINE];
+                    shell_cmd(args, s_buf, sizeof(s_buf));
+                    strncat(out, s_buf, out_size - strlen(out) - 1);
+                }
             } else {
-                char *val = get_variable(inner);
-                if (val) strcat(res, val);
+                char *val = get_variable(ctx, inner);
+                if (val) strncat(out, val, out_size - strlen(out) - 1);
             }
             free(inner);
             p = end + 1;
         } else {
-            strncat(res, p, 1);
+            size_t cur_len = strlen(out);
+            if (cur_len < out_size - 1) {
+                out[cur_len] = *p;
+                out[cur_len + 1] = 0;
+            }
             p++;
         }
     }
-    return res;
 }
 
-/* ---------- Safe command execution ---------- */
 char **parse_command_line(const char *cmd_line, int *argc) {
-    char *line = strdup(cmd_line);
-    if (!line) return NULL;
     char **argv = malloc(MAX_ARGS * sizeof(char*));
-    if (!argv) { free(line); return NULL; }
+    if (!argv) return NULL;
     int i = 0;
-    char *p = line;
+    const char *p = cmd_line;
+    char arg[MAX_LINE];
+    int arg_len = 0;
+
     while (*p && i < MAX_ARGS - 1) {
-        while (isspace((unsigned char)*p)) p++;
+        while (*p && isspace((unsigned char)*p)) p++;
         if (!*p) break;
-        if (*p == '"' || *p == '\'') {
-            char quote = *p++;
-            char *start = p;
-            while (*p && *p != quote) p++;
-            if (*p == quote) {
-                *p = 0;
-                argv[i++] = strdup(start);
-                p++;
+
+        arg_len = 0;
+        int in_quote = 0;
+        char quote_char = 0;
+
+        while (*p) {
+            if (in_quote) {
+                if (*p == '\\') {
+                    p++;
+                    if (!*p) break;
+                    if (*p == 'n') { if (arg_len < MAX_LINE - 1) arg[arg_len++] = '\n'; }
+                    else if (*p == 't') { if (arg_len < MAX_LINE - 1) arg[arg_len++] = '\t'; }
+                    else if (*p == 'r') { if (arg_len < MAX_LINE - 1) arg[arg_len++] = '\r'; }
+                    else { if (arg_len < MAX_LINE - 1) arg[arg_len++] = *p; }
+                } else if (*p == quote_char) {
+                    in_quote = 0;
+                    quote_char = 0;
+                } else {
+                    if (arg_len < MAX_LINE - 1) arg[arg_len++] = *p;
+                }
             } else {
-                argv[i++] = strdup(start);
+                if (isspace((unsigned char)*p)) {
+                    break;
+                } else if (*p == '"' || *p == '\'') {
+                    in_quote = 1;
+                    quote_char = *p;
+                } else if (*p == '\\') {
+                    p++;
+                    if (!*p) break;
+                    if (*p == 'n') { if (arg_len < MAX_LINE - 1) arg[arg_len++] = '\n'; }
+                    else if (*p == 't') { if (arg_len < MAX_LINE - 1) arg[arg_len++] = '\t'; }
+                    else if (*p == 'r') { if (arg_len < MAX_LINE - 1) arg[arg_len++] = '\r'; }
+                    else { if (arg_len < MAX_LINE - 1) arg[arg_len++] = *p; }
+                } else {
+                    if (arg_len < MAX_LINE - 1) arg[arg_len++] = *p;
+                }
             }
-        } else {
-            char *start = p;
-            while (*p && !isspace((unsigned char)*p)) p++;
-            if (*p) {
-                *p = 0;
-                p++;
-            }
-            argv[i++] = strdup(start);
+            p++;
         }
+        arg[arg_len] = 0;
+        argv[i++] = strdup(arg);
     }
     argv[i] = NULL;
     *argc = i;
-    free(line);
     return argv;
 }
 
-int execute_command(char **argv) {
-    if (dry_run) {
+int execute_command(UmkCtx *ctx, char **argv) {
+    if (ctx->dry_run) {
         for (int i = 0; argv[i]; i++) {
             if (i > 0) printf(" ");
             printf("%s", argv[i]);
@@ -384,24 +511,23 @@ int execute_command(char **argv) {
     }
 }
 
-int execute_shell_safe(const char *cmd_line) {
+int execute_shell_safe(UmkCtx *ctx, const char *cmd_line) {
     int argc;
     char **argv = parse_command_line(cmd_line, &argc);
     if (!argv || argc == 0) {
         if (argv) free(argv);
         return 0;
     }
-    int ret = execute_command(argv);
+    int ret = execute_command(ctx, argv);
     for (int i = 0; i < argc; i++) free(argv[i]);
     free(argv);
     return ret;
 }
 
-/* ---------- Auto-variable expansion ---------- */
 void expand_autovars(const char *cmd, const char *target, StrVec *deps, char *out, size_t out_size) {
     out[0] = 0;
     int out_len = 0;
-    for (const char *p = cmd; *p && out_len < out_size - 1; p++) {
+    for (const char *p = cmd; *p && out_len < (int)out_size - 1; p++) {
         if (*p == '$' && p[1] == '@') {
             strncat(out, target, out_size - strlen(out) - 1);
             p++;
@@ -422,9 +548,9 @@ void expand_autovars(const char *cmd, const char *target, StrVec *deps, char *ou
     }
 }
 
-/* ---------- Parsing (unchanged) ---------- */
 static Flag *parse_flag_line(const char *line) {
     char copy[MAX_LINE];
+    if (strlen(line) >= MAX_LINE) return NULL;
     strcpy(copy, line);
     trim(copy);
     if (strncmp(copy, "-fg(", 4) != 0 && strncmp(copy, "+fg(", 4) != 0)
@@ -445,14 +571,16 @@ static Flag *parse_flag_line(const char *line) {
     return f;
 }
 
-void parse_umkfile(const char *filename) {
+void parse_umkfile(UmkCtx *ctx, const char *filename) {
     FILE *fp = fopen(filename, "r");
-    if (!fp) { print_color(COLOR_RED, "No UMK file"); exit(1); }
+    if (!fp) { print_color(ctx, COLOR_RED, "No UMK file"); exit(1); }
     char line[MAX_LINE];
     Command *cur_cmd = NULL;
     Flag *cur_flag = NULL;
     int in_flags = 0;
+    int line_num = 0;
     while (fgets(line, sizeof(line), fp)) {
+        line_num++;
         char orig[MAX_LINE];
         strcpy(orig, line);
         trim(line);
@@ -460,8 +588,8 @@ void parse_umkfile(const char *filename) {
         if (strncmp(line, "threadreap", 10) == 0) {
             char *p = line + 10;
             while (isspace((unsigned char)*p)) p++;
-            if (strcmp(p, "-auto") == 0) parallel_auto = 1;
-            else if (*p == '-') { int n = atoi(p + 1); if (n > 0) parallel_jobs = n; }
+            if (strcmp(p, "-auto") == 0) ctx->parallel_auto = 1;
+            else if (*p == '-') { int n = atoi(p + 1); if (n > 0) ctx->parallel_jobs = n; }
             continue;
         }
         char *eq = strchr(line, '=');
@@ -469,7 +597,9 @@ void parse_umkfile(const char *filename) {
             *eq = 0;
             char *name = line, *val = eq + 1;
             trim(name); trim(val);
-            add_variable(name, expand(val));
+            char exp_val[MAX_LINE];
+            expand(ctx, val, exp_val, sizeof(exp_val));
+            add_variable(ctx, name, exp_val);
             continue;
         }
         char *colon = strchr(line, ':');
@@ -479,90 +609,114 @@ void parse_umkfile(const char *filename) {
             trim(target); trim(deps);
             if (strlen(deps) == 0) {
                 Command *cmd = malloc(sizeof(Command));
-                strcpy(cmd->name, target);
+                if (!cmd) { perror("malloc"); exit(1); }
+                strncpy(cmd->name, target, MAX_NAME - 1);
+                cmd->name[MAX_NAME - 1] = 0;
                 strvec_init(&cmd->commands);
                 cmd->flags = NULL;
-                cmd->next = commands;
-                commands = cmd;
+                cmd->next = ctx->commands;
+                ctx->commands = cmd;
                 cur_cmd = cmd;
             } else {
                 Rule *r = malloc(sizeof(Rule));
+                if (!r) { perror("malloc"); exit(1); }
                 r->target = strdup(target);
                 strvec_init(&r->deps);
                 strvec_init(&r->commands);
-                char *exp_deps = expand(deps);
+                char exp_deps[MAX_LINE];
+                expand(ctx, deps, exp_deps, sizeof(exp_deps));
                 char *copy = strdup(exp_deps);
                 char *tok = strtok(copy, " ");
                 while (tok) { strvec_add(&r->deps, tok); tok = strtok(NULL, " "); }
                 free(copy);
                 if (fgets(line, sizeof(line), fp)) {
+                    line_num++;
                     char trimmed[MAX_LINE];
                     strcpy(trimmed, line);
                     trim(trimmed);
                     if (line[0] == '\t') strvec_add(&r->commands, trimmed);
                 }
                 while (fgets(line, sizeof(line), fp)) {
+                    line_num++;
                     char trimmed[MAX_LINE];
                     strcpy(trimmed, line);
                     trim(trimmed);
                     if (strcmp(trimmed, "eoc") == 0) break;
                     if (line[0] == '\t') strvec_add(&r->commands, trimmed);
                 }
-                r->next = rules;
-                rules = r;
+                r->next = ctx->rules;
+                ctx->rules = r;
             }
             continue;
         }
         if (strcmp(line, "eoc") == 0) { cur_cmd = NULL; in_flags = 0; cur_flag = NULL; continue; }
-        if (!cur_cmd) continue;
+        if (!cur_cmd) {
+            fprintf(stderr, "%s:%d: error: statement outside of any command/rule block: '%s'\n", filename, line_num, line);
+            exit(1);
+        }
         if (strcmp(line, "+flags:") == 0) { in_flags = 1; continue; }
         if (in_flags) {
             if (strcmp(line, ";") == 0) { in_flags = 0; cur_flag = NULL; continue; }
             Flag *new_flag = parse_flag_line(orig);
-            if (new_flag) { new_flag->next = cur_cmd->flags; cur_cmd->flags = new_flag; cur_flag = new_flag; continue; }
+            if (new_flag) {
+                new_flag->next = cur_cmd->flags;
+                cur_cmd->flags = new_flag;
+                cur_flag = new_flag;
+                continue;
+            }
             if (strcmp(line, "eofg") == 0) { cur_flag = NULL; continue; }
-            if (cur_flag) strvec_add(&cur_flag->commands, line);
+            if (cur_flag) {
+                strvec_add(&cur_flag->commands, line);
+            } else {
+                fprintf(stderr, "%s:%d: error: flag commands defined without active flag group\n", filename, line_num);
+                exit(1);
+            }
             continue;
         }
-        if (line[0] != '\t') strvec_add(&cur_cmd->commands, line);
+        if (line[0] != '\t') {
+            strvec_add(&cur_cmd->commands, line);
+        }
+    }
+    if (in_flags || cur_cmd) {
+        fprintf(stderr, "%s:%d: error: unexpected end of file (unclosed command or flag block)\n", filename, line_num);
+        exit(1);
     }
     fclose(fp);
 }
 
-/* ---------- Execution helpers (parallel-aware) ---------- */
-static int exec_command_list(StrVec *cmds, int parallel_mode) {
+static int exec_command_list(UmkCtx *ctx, StrVec *cmds, int parallel_mode) {
     for (int i = 0; i < cmds->count; i++) {
-        char *exp = expand(cmds->items[i]);
+        char exp[MAX_LINE];
+        expand(ctx, cmds->items[i], exp, sizeof(exp));
         char line[MAX_LINE];
-        strcpy(line, exp);
+        strncpy(line, exp, sizeof(line) - 1);
+        line[sizeof(line) - 1] = 0;
         trim(line);
         int ret;
         if (strncmp(line, "call ", 5) == 0) {
             char *target = line + 5;
             trim(target);
-            if (parallel_mode && parallel_jobs > 1) {
-                // В параллельном режиме call должен быть интегрирован в граф.
-                // Для простоты: рекурсивно вызываем параллельную сборку подцели.
-                ret = execute_parallel(target);
+            if (parallel_mode && ctx->parallel_jobs > 1) {
+                ret = execute_parallel(ctx, target);
             } else {
-                ret = execute_serial(target);
+                ret = execute_serial(ctx, target);
             }
         } else {
-            ret = execute_shell_safe(line);
+            ret = execute_shell_safe(ctx, line);
         }
         if (ret != 0) return ret;
     }
     return 0;
 }
 
-static int exec_flags_of_type(Command *c, int type, int parallel_mode) {
+static int exec_flags_of_type(UmkCtx *ctx, Command *c, int type, int parallel_mode) {
     for (Flag *f = c->flags; f; f = f->next) {
         if (f->type != type) continue;
-        for (int i = 0; i < global_flag_count; i++) {
-            char *flag_name = global_flags[i];
+        for (int i = 0; i < ctx->global_flag_count; i++) {
+            char *flag_name = ctx->global_flags[i];
             if (flag_name[0] == '-') flag_name += (flag_name[1] == '-') ? 2 : 1;
             if (strcmp(f->name, flag_name) == 0) {
-                int ret = exec_command_list(&f->commands, parallel_mode);
+                int ret = exec_command_list(ctx, &f->commands, parallel_mode);
                 if (ret != 0) return ret;
                 break;
             }
@@ -571,29 +725,30 @@ static int exec_flags_of_type(Command *c, int type, int parallel_mode) {
     return 0;
 }
 
-/* ---------- Serial execution (original) ---------- */
-int execute_serial(const char *target_name) {
+int execute_serial(UmkCtx *ctx, const char *target_name) {
     char clean[MAX_LINE];
+    if (strlen(target_name) >= MAX_LINE) return 1;
     strcpy(clean, target_name);
     trim(clean);
     if (strlen(clean) == 0) return 0;
-    for (Command *c = commands; c; c = c->next) {
+    for (Command *c = ctx->commands; c; c = c->next) {
         if (strcmp(c->name, clean) != 0) continue;
-        int ret = exec_flags_of_type(c, 0, 0);
+        int ret = exec_flags_of_type(ctx, c, 0, 0);
         if (ret != 0) return ret;
-        ret = exec_command_list(&c->commands, 0);
+        ret = exec_command_list(ctx, &c->commands, 0);
         if (ret != 0) return ret;
-        return exec_flags_of_type(c, 1, 0);
+        return exec_flags_of_type(ctx, c, 1, 0);
     }
-    for (Rule *r = rules; r; r = r->next) {
+    for (Rule *r = ctx->rules; r; r = r->next) {
         if (!match_pattern(clean, r->target)) continue;
         StrVec actual_deps;
         strvec_init(&actual_deps);
         if (strchr(r->target, '%')) {
-            char *stem = apply_pattern(clean, r->target);
-            if (stem) {
+            char stem[MAX_LINE] = "";
+            if (apply_pattern(clean, r->target, stem, sizeof(stem))) {
                 for (int i = 0; i < r->deps.count; i++) {
                     char buf[MAX_LINE];
+                    if (strlen(r->deps.items[i]) >= MAX_LINE) continue;
                     strcpy(buf, r->deps.items[i]);
                     char res[MAX_LINE] = "";
                     int pos = 0;
@@ -613,28 +768,29 @@ int execute_serial(const char *target_name) {
             for (int i = 0; i < r->deps.count; i++) strvec_add(&actual_deps, r->deps.items[i]);
         }
         for (int i = 0; i < actual_deps.count; i++) {
-            int ret = execute_serial(actual_deps.items[i]);
+            int ret = execute_serial(ctx, actual_deps.items[i]);
             if (ret != 0) { strvec_free(&actual_deps); return ret; }
         }
-        if (!needs_rebuild(clean, &actual_deps) && !dry_run) { strvec_free(&actual_deps); return 0; }
+        if (!needs_rebuild(ctx, clean, &actual_deps) && !ctx->dry_run) { strvec_free(&actual_deps); return 0; }
         for (int i = 0; i < r->commands.count; i++) {
             char expanded[MAX_LINE];
             expand_autovars(r->commands.items[i], clean, &actual_deps, expanded, sizeof(expanded));
-            char *final = expand(expanded);
-            int ret = execute_shell_safe(final);
+            char final[MAX_LINE];
+            expand(ctx, expanded, final, sizeof(final));
+            int ret = execute_shell_safe(ctx, final);
             if (ret != 0) { strvec_free(&actual_deps); return ret; }
         }
+        mark_rebuilt(ctx, clean, &actual_deps);
         strvec_free(&actual_deps);
         return 0;
     }
-    if (get_mtime(clean) != 0) return 0;
+    if (access(clean, F_OK) == 0) return 0;
     char msg[MAX_LINE];
     snprintf(msg, sizeof(msg), "Unknown target: %s", clean);
-    print_color(COLOR_RED, msg);
+    print_color(ctx, COLOR_RED, msg);
     return 1;
 }
 
-/* ---------- Parallel execution (make -j style) ---------- */
 int get_cpu_count(void) {
 #ifdef _SC_NPROCESSORS_ONLN
     long n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -649,48 +805,48 @@ int get_cpu_count(void) {
     return count > 0 ? count : 1;
 }
 
-void add_ready_job(Job *job) {
+void add_ready_job(UmkCtx *ctx, Job *job) {
     if (job->state != 0) return;
-    if (ready_queue_size >= ready_queue_capacity) {
-        ready_queue_capacity = ready_queue_capacity ? ready_queue_capacity * 2 : 16;
-        ready_queue = realloc(ready_queue, ready_queue_capacity * sizeof(Job*));
-        if (!ready_queue) { perror("realloc ready_queue"); exit(1); }
+    if (ctx->ready_queue_size >= ctx->ready_queue_capacity) {
+        ctx->ready_queue_capacity = ctx->ready_queue_capacity ? ctx->ready_queue_capacity * 2 : 16;
+        ctx->ready_queue = realloc(ctx->ready_queue, ctx->ready_queue_capacity * sizeof(Job*));
+        if (!ctx->ready_queue) { perror("realloc ready_queue"); exit(1); }
     }
-    ready_queue[ready_queue_size++] = job;
+    ctx->ready_queue[ctx->ready_queue_size++] = job;
 }
 
-Job *pop_ready_job(void) {
-    if (ready_queue_size == 0) return NULL;
-    return ready_queue[--ready_queue_size];
+Job *pop_ready_job(UmkCtx *ctx) {
+    if (ctx->ready_queue_size == 0) return NULL;
+    return ctx->ready_queue[--ctx->ready_queue_size];
 }
 
-Job *find_job_by_pid(pid_t pid) {
-    for (Job *j = all_jobs; j; j = j->next)
+Job *find_job_by_pid(UmkCtx *ctx, pid_t pid) {
+    for (Job *j = ctx->all_jobs; j; j = j->next)
         if (j->state == 1 && j->pid == pid) return j;
     return NULL;
 }
 
-Job *find_job_by_target(const char *target) {
-    for (Job *j = all_jobs; j; j = j->next)
+Job *find_job_by_target(UmkCtx *ctx, const char *target) {
+    for (Job *j = ctx->all_jobs; j; j = j->next)
         if (strcmp(j->target, target) == 0) return j;
     return NULL;
 }
 
-void mark_dependency_done(Job *job) {
-    for (Job *j = all_jobs; j; j = j->next) {
+void mark_dependency_done(UmkCtx *ctx, Job *job) {
+    for (Job *j = ctx->all_jobs; j; j = j->next) {
         if (j->state != 0) continue;
         for (int i = 0; i < j->deps->count; i++) {
             if (strcmp(j->deps->items[i], job->target) == 0) {
                 j->deps_remaining--;
-                if (j->deps_remaining == 0 && j->state == 0) add_ready_job(j);
+                if (j->deps_remaining == 0 && j->state == 0) add_ready_job(ctx, j);
                 break;
             }
         }
     }
 }
 
-void free_job_graph(void) {
-    Job *j = all_jobs;
+void free_job_graph(UmkCtx *ctx) {
+    Job *j = ctx->all_jobs;
     while (j) {
         Job *next = j->next;
         free(j->target);
@@ -698,12 +854,12 @@ void free_job_graph(void) {
         free(j);
         j = next;
     }
-    all_jobs = NULL;
-    if (ready_queue) { free(ready_queue); ready_queue = NULL; }
-    ready_queue_size = ready_queue_capacity = jobs_running = build_failed = 0;
+    ctx->all_jobs = NULL;
+    if (ctx->ready_queue) { free(ctx->ready_queue); ctx->ready_queue = NULL; }
+    ctx->ready_queue_size = ctx->ready_queue_capacity = ctx->jobs_running = ctx->build_failed = 0;
 }
 
-Job *build_job_graph(const char *target, StrVec *path) {
+Job *build_job_graph(UmkCtx *ctx, const char *target, StrVec *path) {
     for (int i = 0; i < path->count; i++)
         if (strcmp(path->items[i], target) == 0) {
             fprintf(stderr, "Circular dependency: ");
@@ -711,36 +867,41 @@ Job *build_job_graph(const char *target, StrVec *path) {
             fprintf(stderr, "%s\n", target);
             exit(1);
         }
-    Job *existing = find_job_by_target(target);
+    Job *existing = find_job_by_target(ctx, target);
     if (existing) return existing;
     Job *job = calloc(1, sizeof(Job));
+    if (!job) { perror("calloc"); exit(1); }
     job->target = strdup(target);
     job->state = 0;
     job->deps = malloc(sizeof(StrVec));
+    if (!job->deps) { perror("malloc"); exit(1); }
     strvec_init(job->deps);
-    job->next = all_jobs;
-    all_jobs = job;
+    job->next = ctx->all_jobs;
+    ctx->all_jobs = job;
     strvec_add(path, target);
-    for (Command *c = commands; c; c = c->next) {
+    for (Command *c = ctx->commands; c; c = c->next) {
         if (strcmp(c->name, target) == 0) {
             job->cmd = c;
             job->rule = NULL;
             job->deps_remaining = 0;
-            add_ready_job(job);
+            add_ready_job(ctx, job);
             strvec_clear(path);
             return job;
         }
     }
-    for (Rule *r = rules; r; r = r->next) {
+    for (Rule *r = ctx->rules; r; r = r->next) {
         if (match_pattern(target, r->target)) {
             job->rule = r;
             job->cmd = NULL;
-            char *stem = NULL;
-            if (strchr(r->target, '%')) stem = apply_pattern(target, r->target);
+            char stem[MAX_LINE] = "";
+            int has_stem = 0;
+            if (strchr(r->target, '%')) {
+                has_stem = apply_pattern(target, r->target, stem, sizeof(stem));
+            }
             for (int i = 0; i < r->deps.count; i++) {
                 char *dep_pattern = r->deps.items[i];
                 char dep_buf[MAX_LINE];
-                if (stem) {
+                if (has_stem) {
                     dep_buf[0] = 0;
                     int pos = 0;
                     for (char *p = dep_pattern; *p; p++) {
@@ -753,46 +914,48 @@ Job *build_job_graph(const char *target, StrVec *path) {
                         }
                     }
                 } else {
+                    if (strlen(dep_pattern) >= MAX_LINE) continue;
                     strcpy(dep_buf, dep_pattern);
                 }
                 strvec_add(job->deps, dep_buf);
-                build_job_graph(dep_buf, path);
+                build_job_graph(ctx, dep_buf, path);
             }
-            free(stem);
             job->deps_remaining = job->deps->count;
-            if (job->deps_remaining == 0) add_ready_job(job);
+            if (job->deps_remaining == 0) add_ready_job(ctx, job);
             strvec_clear(path);
             return job;
         }
     }
-    if (get_mtime(target) != 0) {
+    if (access(target, F_OK) == 0) {
         job->deps_remaining = 0;
-        add_ready_job(job);
+        add_ready_job(ctx, job);
         strvec_clear(path);
         return job;
     }
     char msg[MAX_LINE];
     snprintf(msg, sizeof(msg), "Unknown target: %s", target);
-    print_color(COLOR_RED, msg);
+    print_color(ctx, COLOR_RED, msg);
     exit(1);
 }
 
-int run_job(Job *job) {
+int run_job(UmkCtx *ctx, Job *job) {
     if (job->cmd) {
-        int ret = exec_flags_of_type(job->cmd, 0, 1);
+        int ret = exec_flags_of_type(ctx, job->cmd, 0, 1);
         if (ret != 0) return ret;
-        ret = exec_command_list(&job->cmd->commands, 1);
+        ret = exec_command_list(ctx, &job->cmd->commands, 1);
         if (ret != 0) return ret;
-        return exec_flags_of_type(job->cmd, 1, 1);
+        return exec_flags_of_type(ctx, job->cmd, 1, 1);
     } else if (job->rule) {
-        if (!needs_rebuild(job->target, job->deps) && !dry_run) return 0;
+        if (!needs_rebuild(ctx, job->target, job->deps) && !ctx->dry_run) return 0;
         for (int i = 0; i < job->rule->commands.count; i++) {
             char expanded[MAX_LINE];
             expand_autovars(job->rule->commands.items[i], job->target, job->deps, expanded, sizeof(expanded));
-            char *final = expand(expanded);
-            int ret = execute_shell_safe(final);
+            char final[MAX_LINE];
+            expand(ctx, expanded, final, sizeof(final));
+            int ret = execute_shell_safe(ctx, final);
             if (ret != 0) return ret;
         }
+        mark_rebuilt(ctx, job->target, job->deps);
         return 0;
     }
     return 0;
@@ -800,13 +963,16 @@ int run_job(Job *job) {
 
 void handle_sigint(int sig) {
     (void)sig;
-    interrupted = 1;
-    for (Job *j = all_jobs; j; j = j->next)
-        if (j->state == 1 && j->pid > 0) kill(j->pid, SIGTERM);
+    if (active_ctx) {
+        active_ctx->interrupted = 1;
+        for (Job *j = active_ctx->all_jobs; j; j = j->next)
+            if (j->state == 1 && j->pid > 0) kill(j->pid, SIGTERM);
+    }
 }
 
-int execute_parallel(const char *target_name) {
+int execute_parallel(UmkCtx *ctx, const char *target_name) {
     char clean[MAX_LINE];
+    if (strlen(target_name) >= MAX_LINE) return 1;
     strcpy(clean, target_name);
     trim(clean);
     if (strlen(clean) == 0) return 0;
@@ -814,80 +980,114 @@ int execute_parallel(const char *target_name) {
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_sigint;
     sigaction(SIGINT, &sa, NULL);
-    all_jobs = NULL;
-    ready_queue = NULL;
-    ready_queue_size = ready_queue_capacity = jobs_running = build_failed = 0;
+    active_ctx = ctx;
+    ctx->all_jobs = NULL;
+    ctx->ready_queue = NULL;
+    ctx->ready_queue_size = ctx->ready_queue_capacity = ctx->jobs_running = ctx->build_failed = 0;
     StrVec path;
     strvec_init(&path);
-    Job *root = build_job_graph(clean, &path);
+    Job *root = build_job_graph(ctx, clean, &path);
     strvec_free(&path);
     if (!root) return 1;
-    while ((ready_queue_size > 0 || jobs_running > 0) && !build_failed && !interrupted) {
-        while (ready_queue_size > 0 && jobs_running < parallel_jobs && !build_failed && !interrupted) {
-            Job *job = pop_ready_job();
-            if (job->state != 0) continue;
+    while ((ctx->ready_queue_size > 0 || ctx->jobs_running > 0) && !ctx->build_failed && !ctx->interrupted) {
+        while (ctx->ready_queue_size > 0 && ctx->jobs_running < ctx->parallel_jobs && !ctx->build_failed && !ctx->interrupted) {
+            Job *job = pop_ready_job(ctx);
+            if (!job || job->state != 0) continue;
             job->state = 1;
-            jobs_running++;
+            ctx->jobs_running++;
             pid_t pid = fork();
-            if (pid == 0) { int ret = run_job(job); exit(ret); }
+            if (pid == 0) { int ret = run_job(ctx, job); exit(ret); }
             else if (pid > 0) job->pid = pid;
-            else { perror("fork"); build_failed = 1; break; }
+            else { perror("fork"); ctx->build_failed = 1; break; }
         }
-        if (jobs_running > 0 && !build_failed && !interrupted) {
+        if (ctx->jobs_running > 0 && !ctx->build_failed && !ctx->interrupted) {
             int status;
             pid_t done = waitpid(-1, &status, 0);
             if (done > 0) {
-                Job *job = find_job_by_pid(done);
+                Job *job = find_job_by_pid(ctx, done);
                 if (job) {
-                    jobs_running--;
+                    ctx->jobs_running--;
                     job->state = 2;
-                    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
-                        build_failed = 1;
+                    if (WIFEXITED(status)) {
+                        int exit_code = WEXITSTATUS(status);
+                        if (exit_code != 0) {
+                            ctx->build_failed = 1;
+                            char msg[MAX_LINE];
+                            snprintf(msg, sizeof(msg), "Job %s failed with exit code %d", job->target, exit_code);
+                            print_color(ctx, COLOR_RED, msg);
+                        }
+                    } else {
+                        ctx->build_failed = 1;
                         char msg[MAX_LINE];
-                        snprintf(msg, sizeof(msg), "Job %s failed with exit code %d", job->target, WEXITSTATUS(status));
-                        print_color(COLOR_RED, msg);
+                        snprintf(msg, sizeof(msg), "Job %s terminated abnormally", job->target);
+                        print_color(ctx, COLOR_RED, msg);
                     }
-                    mark_dependency_done(job);
+                    mark_dependency_done(ctx, job);
                 }
+            } else if (done < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                perror("waitpid");
+                ctx->build_failed = 1;
             }
         }
     }
-    int ret = (build_failed || interrupted) ? 1 : 0;
-    free_job_graph();
+    int ret = (ctx->build_failed || ctx->interrupted) ? 1 : 0;
+    free_job_graph(ctx);
+    active_ctx = NULL;
     return ret;
 }
 
-/* ---------- Cleanup ---------- */
-void free_all(void) {
-    Rule *r = rules;
+void free_all(UmkCtx *ctx) {
+    Rule *r = ctx->rules;
     while (r) { Rule *next = r->next; free(r->target); strvec_free(&r->deps); strvec_free(&r->commands); free(r); r = next; }
-    Command *c = commands;
+    Command *c = ctx->commands;
     while (c) { Command *next = c->next; strvec_free(&c->commands); Flag *f = c->flags; while (f) { Flag *nextf = f->next; strvec_free(&f->commands); free(f); f = nextf; } free(c); c = next; }
-    Variable *v = variables;
+    Variable *v = ctx->variables;
     while (v) { Variable *next = v->next; free(v->value); free(v); v = next; }
+    CacheEntry *ce = ctx->cache;
+    while (ce) { CacheEntry *next = ce->next; free(ce); ce = next; }
 }
 
-/* ---------- Main ---------- */
 int main(int argc, char **argv) {
-    if (argc < 2) { print_color(COLOR_YELLOW, "Usage: umk <command> [flags...] [-j N]"); return 1; }
-    global_flag_count = 0;
-    global_flags = malloc((argc - 2) * sizeof(char*));
-    if (!global_flags) { perror("malloc"); return 1; }
+    UmkCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.parallel_jobs = 1;
+    ctx.use_color = 1;
+
+    if (argc < 2) { print_color(&ctx, COLOR_YELLOW, "Usage: umk <command> [flags...] [-j N]"); return 1; }
+
+    ctx.global_flag_count = 0;
+    int max_flags = argc > 2 ? argc - 2 : 1;
+    ctx.global_flags = malloc(max_flags * sizeof(char*));
+    if (!ctx.global_flags) { perror("malloc"); return 1; }
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-j") == 0 && i + 1 < argc) {
-            parallel_jobs = atoi(argv[++i]);
-            j_from_cmdline = 1;
+        if (strcmp(argv[i], "-j") == 0) {
+            if (i + 1 < argc) {
+                ctx.parallel_jobs = atoi(argv[++i]);
+                ctx.j_from_cmdline = 1;
+            } else {
+                fprintf(stderr, "error: -j requires an argument\n");
+                free(ctx.global_flags);
+                return 1;
+            }
+        } else if (strncmp(argv[i], "-j", 2) == 0 && isdigit((unsigned char)argv[i][2])) {
+            ctx.parallel_jobs = atoi(argv[i] + 2);
+            ctx.j_from_cmdline = 1;
         } else {
-            global_flags[global_flag_count++] = argv[i];
+            ctx.global_flags[ctx.global_flag_count++] = argv[i];
         }
     }
-    parse_umkfile("UMK");
-    if (!j_from_cmdline) { if (parallel_auto) parallel_jobs = get_cpu_count(); }
-    if (parallel_jobs < 1) parallel_jobs = 1;
+    load_cache(&ctx);
+    parse_umkfile(&ctx, "UMK");
+    if (!ctx.j_from_cmdline) { if (ctx.parallel_auto) ctx.parallel_jobs = get_cpu_count(); }
+    if (ctx.parallel_jobs < 1) ctx.parallel_jobs = 1;
     int ret;
-    if (parallel_jobs > 1) ret = execute_parallel(argv[1]);
-    else ret = execute_serial(argv[1]);
-    free(global_flags);
-    free_all();
+    if (ctx.parallel_jobs > 1) ret = execute_parallel(&ctx, argv[1]);
+    else ret = execute_serial(&ctx, argv[1]);
+    save_cache(&ctx);
+    free(ctx.global_flags);
+    free_all(&ctx);
     return ret;
 }
