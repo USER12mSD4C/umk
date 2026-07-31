@@ -87,7 +87,6 @@ typedef struct Job {
     int deps_remaining;
     int state;
     pid_t pid;
-    int rebuild_needed;
     struct Job *next;
 } Job;
 
@@ -97,11 +96,18 @@ typedef struct CacheEntry {
     struct CacheEntry *next;
 } CacheEntry;
 
+typedef struct RuntimeHash {
+    char path[MAX_LINE];
+    unsigned long long hash;
+    struct RuntimeHash *next;
+} RuntimeHash;
+
 typedef struct UmkCtx {
     Rule *rules;
     Command *commands;
     Variable *variables;
     CacheEntry *cache;
+    RuntimeHash *rt_hashes;
     char **global_flags;
     int global_flag_count;
     int use_color;
@@ -148,15 +154,13 @@ void mark_dependency_done(UmkCtx *ctx, Job *job);
 void free_job_graph(UmkCtx *ctx);
 int run_job(UmkCtx *ctx, Job *job);
 void handle_sigint(int sig);
-char **parse_command_line(const char *cmd_line, int *argc);
-int execute_command(UmkCtx *ctx, const char *cmd_line);
 void expand_autovars(const char *cmd, const char *target, StrVec *deps, char *out, size_t out_size);
 
 unsigned long long hash_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
     unsigned long long hash = 14695981039346656037ULL;
-    unsigned char buf[4096];
+    unsigned char buf[8192];
     size_t bytes;
     while ((bytes = fread(buf, 1, sizeof(buf), f)) > 0) {
         for (size_t i = 0; i < bytes; i++) {
@@ -204,22 +208,17 @@ void save_cache(UmkCtx *ctx) {
 }
 
 unsigned long long get_cached_hash(UmkCtx *ctx, const char *path) {
-    CacheEntry *curr = ctx->cache;
-    while (curr) {
+    for (CacheEntry *curr = ctx->cache; curr; curr = curr->next)
         if (strcmp(curr->path, path) == 0) return curr->hash;
-        curr = curr->next;
-    }
     return 0;
 }
 
 void update_cached_hash(UmkCtx *ctx, const char *path, unsigned long long hash_val) {
-    CacheEntry *curr = ctx->cache;
-    while (curr) {
+    for (CacheEntry *curr = ctx->cache; curr; curr = curr->next) {
         if (strcmp(curr->path, path) == 0) {
             curr->hash = hash_val;
             return;
         }
-        curr = curr->next;
     }
     CacheEntry *entry = malloc(sizeof(CacheEntry));
     if (entry) {
@@ -231,10 +230,26 @@ void update_cached_hash(UmkCtx *ctx, const char *path, unsigned long long hash_v
     }
 }
 
+unsigned long long get_current_hash(UmkCtx *ctx, const char *path) {
+    for (RuntimeHash *r = ctx->rt_hashes; r; r = r->next) {
+        if (strcmp(r->path, path) == 0) return r->hash;
+    }
+    unsigned long long h = hash_file(path);
+    RuntimeHash *nr = malloc(sizeof(RuntimeHash));
+    if (nr) {
+        strncpy(nr->path, path, MAX_LINE - 1);
+        nr->path[MAX_LINE - 1] = 0;
+        nr->hash = h;
+        nr->next = ctx->rt_hashes;
+        ctx->rt_hashes = nr;
+    }
+    return h;
+}
+
 int needs_rebuild(UmkCtx *ctx, const char *target, StrVec *deps) {
     if (access(target, F_OK) != 0) return 1;
 
-    unsigned long long target_curr = hash_file(target);
+    unsigned long long target_curr = get_current_hash(ctx, target);
     unsigned long long target_cached = get_cached_hash(ctx, target);
     if (target_curr == 0 || target_cached == 0 || target_curr != target_cached) {
         return 1;
@@ -244,7 +259,7 @@ int needs_rebuild(UmkCtx *ctx, const char *target, StrVec *deps) {
         const char *dep = deps->items[i];
         if (access(dep, F_OK) != 0) return 1;
 
-        unsigned long long dep_curr = hash_file(dep);
+        unsigned long long dep_curr = get_current_hash(ctx, dep);
         unsigned long long dep_cached = get_cached_hash(ctx, dep);
         if (dep_curr == 0 || dep_cached == 0 || dep_curr != dep_cached) {
             return 1;
@@ -310,11 +325,16 @@ void wildcard(const char *pattern, char *out, size_t out_size) {
     DIR *d = opendir(".");
     if (!d) return;
     struct dirent *e;
+    size_t len = 0;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
         if (match_pattern(e->d_name, pattern)) {
-            if (strlen(out) > 0) strncat(out, " ", out_size - strlen(out) - 1);
-            strncat(out, e->d_name, out_size - strlen(out) - 1);
+            size_t nlen = strlen(e->d_name);
+            if (len + nlen + 2 >= out_size) break;
+            if (len > 0) out[len++] = ' ';
+            strcpy(out + len, e->d_name);
+            len += nlen;
+            out[len] = 0;
         }
     }
     closedir(d);
@@ -327,7 +347,10 @@ void shell_cmd(const char *cmd, char *out, size_t out_size) {
     char line[MAX_LINE];
     if (fgets(line, sizeof(line), f)) {
         trim(line);
-        strncat(out, line, out_size - strlen(out) - 1);
+        size_t len = strlen(line);
+        if (len >= out_size) len = out_size - 1;
+        memcpy(out, line, len);
+        out[len] = 0;
     }
     pclose(f);
 }
@@ -366,7 +389,8 @@ int apply_pattern(const char *target, const char *pattern, char *out, size_t out
     for (char *x = p; *x; x++) if (*x == '%') *x = '*';
     char *star = strchr(p, '*');
     if (!star) {
-        strncat(out, pattern, out_size - 1);
+        strncpy(out, pattern, out_size - 1);
+        out[out_size - 1] = 0;
         return 1;
     }
     int pre = star - p;
@@ -383,155 +407,147 @@ int apply_pattern(const char *target, const char *pattern, char *out, size_t out
 }
 
 void expand(UmkCtx *ctx, const char *str, char *out, size_t out_size) {
+    size_t len = 0;
     out[0] = 0;
     const char *p = str;
-    while (*p) {
+    while (*p && len < out_size - 1) {
         if (*p == '$' && p[1] == '(') {
             const char *end = strchr(p, ')');
-            if (!end) {
-                strncat(out, p, out_size - strlen(out) - 1);
-                break;
-            }
-            int len = end - p - 2;
-            char *inner = malloc(len + 1);
-            if (!inner) { perror("malloc"); exit(1); }
-            strncpy(inner, p + 2, len);
-            inner[len] = 0;
+            if (!end) break;
+            char inner[1024];
+            size_t ilen = end - p - 2;
+            if (ilen >= sizeof(inner)) ilen = sizeof(inner) - 1;
+            strncpy(inner, p + 2, ilen);
+            inner[ilen] = 0;
+
             char *space = strchr(inner, ' ');
-            if (space) {
+            char *subst = strchr(inner, ':');
+
+            if (space && (!subst || space < subst)) {
                 *space = 0;
-                char *func = inner;
                 char *args = space + 1;
-                if (strcmp(func, "wildcard") == 0) {
+                if (strcmp(inner, "wildcard") == 0) {
                     char w_buf[MAX_LINE];
                     wildcard(args, w_buf, sizeof(w_buf));
-                    strncat(out, w_buf, out_size - strlen(out) - 1);
-                } else if (strcmp(func, "shell") == 0) {
+                    size_t wlen = strlen(w_buf);
+                    if (len + wlen >= out_size) wlen = out_size - len - 1;
+                    memcpy(out + len, w_buf, wlen);
+                    len += wlen;
+                    out[len] = 0;
+                } else if (strcmp(inner, "shell") == 0) {
                     char s_buf[MAX_LINE];
                     shell_cmd(args, s_buf, sizeof(s_buf));
-                    strncat(out, s_buf, out_size - strlen(out) - 1);
+                    size_t slen = strlen(s_buf);
+                    if (len + slen >= out_size) slen = out_size - len - 1;
+                    memcpy(out + len, s_buf, slen);
+                    len += slen;
+                    out[len] = 0;
+                }
+            } else if (subst) {
+                *subst = 0;
+                char *var = inner;
+                char *rule = subst + 1;
+                char *eq = strchr(rule, '=');
+                if (eq) {
+                    *eq = 0;
+                    char *from = rule;
+                    char *to = eq + 1;
+                    char *val = get_variable(ctx, var);
+                    if (val) {
+                        char temp_out[MAX_LINE];
+                        temp_out[0] = 0;
+                        size_t tlen = 0;
+                        char *saveptr;
+                        char *tok = strtok_r(val, " ", &saveptr);
+                        while (tok) {
+                            size_t t_len = strlen(tok);
+                            size_t f_len = strlen(from);
+                            int matches = 0;
+                            if (f_len == 0) matches = 1;
+                            else if (t_len >= f_len && strcmp(tok + t_len - f_len, from) == 0) matches = 1;
+
+                            if (matches) {
+                                size_t prefix_len = t_len - f_len;
+                                if (tlen + prefix_len + strlen(to) + 1 < sizeof(temp_out)) {
+                                    memcpy(temp_out + tlen, tok, prefix_len);
+                                    tlen += prefix_len;
+                                    strcpy(temp_out + tlen, to);
+                                    tlen += strlen(to);
+                                    temp_out[tlen++] = ' ';
+                                    temp_out[tlen] = 0;
+                                }
+                            } else {
+                                if (tlen + t_len + 1 < sizeof(temp_out)) {
+                                    memcpy(temp_out + tlen, tok, t_len);
+                                    tlen += t_len;
+                                    temp_out[tlen++] = ' ';
+                                    temp_out[tlen] = 0;
+                                }
+                            }
+                            tok = strtok_r(NULL, " ", &saveptr);
+                        }
+                        if (tlen > 0) temp_out[tlen - 1] = 0;
+                        size_t t_out_len = strlen(temp_out);
+                        if (len + t_out_len >= out_size) t_out_len = out_size - len - 1;
+                        memcpy(out + len, temp_out, t_out_len);
+                        len += t_out_len;
+                        out[len] = 0;
+                    }
                 }
             } else {
                 char *val = get_variable(ctx, inner);
-                if (val) strncat(out, val, out_size - strlen(out) - 1);
+                if (val) {
+                    size_t vlen = strlen(val);
+                    if (len + vlen >= out_size) vlen = out_size - len - 1;
+                    memcpy(out + len, val, vlen);
+                    len += vlen;
+                    out[len] = 0;
+                }
             }
-            free(inner);
             p = end + 1;
         } else {
-            size_t cur_len = strlen(out);
-            if (cur_len < out_size - 1) {
-                out[cur_len] = *p;
-                out[cur_len + 1] = 0;
-            }
-            p++;
+            out[len++] = *p++;
+            out[len] = 0;
         }
     }
-}
-
-char **parse_command_line(const char *cmd_line, int *argc) {
-    char **argv = malloc(MAX_ARGS * sizeof(char*));
-    if (!argv) return NULL;
-    int i = 0;
-    const char *p = cmd_line;
-    char arg[MAX_LINE];
-    int arg_len = 0;
-
-    while (*p && i < MAX_ARGS - 1) {
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (!*p) break;
-
-        arg_len = 0;
-        int in_quote = 0;
-        char quote_char = 0;
-
-        while (*p) {
-            if (in_quote) {
-                if (*p == '\\') {
-                    p++;
-                    if (!*p) break;
-                    if (*p == 'n') { if (arg_len < MAX_LINE - 1) arg[arg_len++] = '\n'; }
-                    else if (*p == 't') { if (arg_len < MAX_LINE - 1) arg[arg_len++] = '\t'; }
-                    else if (*p == 'r') { if (arg_len < MAX_LINE - 1) arg[arg_len++] = '\r'; }
-                    else { if (arg_len < MAX_LINE - 1) arg[arg_len++] = *p; }
-                } else if (*p == quote_char) {
-                    in_quote = 0;
-                    quote_char = 0;
-                } else {
-                    if (arg_len < MAX_LINE - 1) arg[arg_len++] = *p;
-                }
-            } else {
-                if (isspace((unsigned char)*p)) {
-                    break;
-                } else if (*p == '"' || *p == '\'') {
-                    in_quote = 1;
-                    quote_char = *p;
-                } else if (*p == '\\') {
-                    p++;
-                    if (!*p) break;
-                    if (*p == 'n') { if (arg_len < MAX_LINE - 1) arg[arg_len++] = '\n'; }
-                    else if (*p == 't') { if (arg_len < MAX_LINE - 1) arg[arg_len++] = '\t'; }
-                    else if (*p == 'r') { if (arg_len < MAX_LINE - 1) arg[arg_len++] = '\r'; }
-                    else { if (arg_len < MAX_LINE - 1) arg[arg_len++] = *p; }
-                } else {
-                    if (arg_len < MAX_LINE - 1) arg[arg_len++] = *p;
-                }
-            }
-            p++;
-        }
-        arg[arg_len] = 0;
-        argv[i++] = strdup(arg);
-    }
-    argv[i] = NULL;
-    *argc = i;
-    return argv;
-}
-
-int execute_command(UmkCtx *ctx, const char *cmd_line) {
-    if (ctx->dry_run) {
-        printf("%s\n", cmd_line);
-        return 0;
-    }
-    pid_t pid = fork();
-    if (pid == 0) {
-        execl("/bin/sh", "sh", "-c", cmd_line, (char *)NULL);
-        perror("execl");
-        exit(127);
-    } else if (pid > 0) {
-        int status;
-        waitpid(pid, &status, 0);
-        if (WIFEXITED(status)) return WEXITSTATUS(status);
-        return 1;
-    } else {
-        perror("fork");
-        return 1;
-    }
-}
-
-int execute_shell_safe(UmkCtx *ctx, const char *cmd_line) {
-    return execute_command(ctx, cmd_line);
 }
 
 void expand_autovars(const char *cmd, const char *target, StrVec *deps, char *out, size_t out_size) {
+    size_t len = 0;
     out[0] = 0;
-    int out_len = 0;
-    for (const char *p = cmd; *p && out_len < (int)out_size - 1; p++) {
-        if (*p == '$' && p[1] == '@') {
-            strncat(out, target, out_size - strlen(out) - 1);
-            p++;
-        } else if (*p == '$' && p[1] == '<') {
-            if (deps && deps->count > 0)
-                strncat(out, deps->items[0], out_size - strlen(out) - 1);
-            p++;
-        } else if (*p == '$' && p[1] == '^') {
-            for (int i = 0; i < deps->count; i++) {
-                if (i > 0) strncat(out, " ", out_size - strlen(out) - 1);
-                strncat(out, deps->items[i], out_size - strlen(out) - 1);
+    const char *p = cmd;
+    while (*p && len < out_size - 1) {
+        if (*p == '$') {
+            if (p[1] == '@') {
+                size_t tlen = strlen(target);
+                if (len + tlen >= out_size) tlen = out_size - len - 1;
+                memcpy(out + len, target, tlen);
+                len += tlen; out[len] = 0;
+                p += 2; continue;
+            } else if (p[1] == '<') {
+                if (deps && deps->count > 0) {
+                    size_t dlen = strlen(deps->items[0]);
+                    if (len + dlen >= out_size) dlen = out_size - len - 1;
+                    memcpy(out + len, deps->items[0], dlen);
+                    len += dlen; out[len] = 0;
+                }
+                p += 2; continue;
+            } else if (p[1] == '^') {
+                for (int i = 0; i < deps->count; i++) {
+                    if (i > 0) {
+                        if (len < out_size - 1) out[len++] = ' ';
+                        out[len] = 0;
+                    }
+                    size_t dlen = strlen(deps->items[i]);
+                    if (len + dlen >= out_size) dlen = out_size - len - 1;
+                    memcpy(out + len, deps->items[i], dlen);
+                    len += dlen; out[len] = 0;
+                }
+                p += 2; continue;
             }
-            p++;
-        } else {
-            char tmp[2] = { *p, 0 };
-            strncat(out, tmp, out_size - strlen(out) - 1);
         }
+        out[len++] = *p++;
+        out[len] = 0;
     }
 }
 
@@ -566,6 +582,11 @@ void parse_umkfile(UmkCtx *ctx, const char *filename) {
     Flag *cur_flag = NULL;
     int in_flags = 0;
     int line_num = 0;
+
+    int skip_depth = 0;
+    int condition_stack[16];
+    int cond_ptr = 0;
+
     while (fgets(line, sizeof(line), fp)) {
         line_num++;
         char orig[MAX_LINE];
@@ -573,6 +594,48 @@ void parse_umkfile(UmkCtx *ctx, const char *filename) {
         trim(line);
         if (is_blank(line)) continue;
         if (line[0] == '#') continue;
+
+        if (strncmp(line, "if ", 3) == 0) {
+            cond_ptr++;
+            if (skip_depth > 0) { skip_depth++; continue; }
+            char exp_line[MAX_LINE];
+            expand(ctx, line + 3, exp_line, sizeof(exp_line));
+            char *eq = strstr(exp_line, "==");
+            int result = 0;
+            if (eq) {
+                *eq = 0;
+                char *left = exp_line;
+                char *right = eq + 2;
+                trim(left); trim(right);
+                if (strcmp(left, right) == 0) result = 1;
+            } else {
+                if (strlen(exp_line) > 0) result = 1;
+            }
+            condition_stack[cond_ptr] = result;
+            if (!result) skip_depth = cond_ptr;
+            continue;
+        }
+        if (strcmp(line, "else") == 0) {
+            if (cond_ptr > 0) {
+                if (skip_depth == cond_ptr) {
+                    skip_depth = 0;
+                    condition_stack[cond_ptr] = 1;
+                } else if (skip_depth == 0 && condition_stack[cond_ptr] == 1) {
+                    skip_depth = cond_ptr;
+                    condition_stack[cond_ptr] = 0;
+                }
+            }
+            continue;
+        }
+        if (strcmp(line, "endif") == 0) {
+            if (cond_ptr > 0) {
+                if (skip_depth == cond_ptr) skip_depth = 0;
+                cond_ptr--;
+            }
+            continue;
+        }
+        if (skip_depth > 0) continue;
+
         if (strncmp(line, "threadreap", 10) == 0) {
             char *p = line + 10;
             while (isspace((unsigned char)*p)) p++;
@@ -580,17 +643,33 @@ void parse_umkfile(UmkCtx *ctx, const char *filename) {
             else if (*p == '-') { int n = atoi(p + 1); if (n > 0) ctx->parallel_jobs = n; }
             continue;
         }
+
         char *eq = strchr(line, '=');
-        if (eq && !in_flags && !cur_cmd) {
+        char *colon = strchr(line, ':');
+
+        if (eq && !in_flags && !cur_cmd && (!colon || eq < colon)) {
+            int is_append = 0;
+            if (eq > line && eq[-1] == '+') {
+                is_append = 1;
+                eq[-1] = 0;
+            }
             *eq = 0;
             char *name = line, *val = eq + 1;
             trim(name); trim(val);
             char exp_val[MAX_LINE];
             expand(ctx, val, exp_val, sizeof(exp_val));
-            add_variable(ctx, name, exp_val);
+            if (is_append) {
+                char *old = get_variable(ctx, name);
+                char new_val[MAX_LINE * 2];
+                if (old) snprintf(new_val, sizeof(new_val), "%s %s", old, exp_val);
+                else snprintf(new_val, sizeof(new_val), "%s", exp_val);
+                add_variable(ctx, name, new_val);
+            } else {
+                add_variable(ctx, name, exp_val);
+            }
             continue;
         }
-        char *colon = strchr(line, ':');
+
         if (colon && !in_flags && !cur_cmd) {
             *colon = 0;
             char *target = line, *deps = colon + 1;
@@ -617,29 +696,28 @@ void parse_umkfile(UmkCtx *ctx, const char *filename) {
                 char *tok = strtok(copy, " ");
                 while (tok) { strvec_add(&r->deps, tok); tok = strtok(NULL, " "); }
                 free(copy);
-                if (fgets(line, sizeof(line), fp)) {
-                    line_num++;
-                    char trimmed[MAX_LINE];
-                    strcpy(trimmed, line);
-                    trim(trimmed);
-                    if (trimmed[0] != '#') {
-                        if (line[0] == '\t') strvec_add(&r->commands, trimmed);
-                    }
-                }
+
                 while (fgets(line, sizeof(line), fp)) {
                     line_num++;
                     char trimmed[MAX_LINE];
                     strcpy(trimmed, line);
                     trim(trimmed);
-                    if (strcmp(trimmed, "eoc") == 0) break;
+                    if (is_blank(trimmed)) continue;
                     if (trimmed[0] == '#') continue;
-                    if (line[0] == '\t') strvec_add(&r->commands, trimmed);
+                    if (strcmp(trimmed, "eoc") == 0) break;
+                    if (isspace((unsigned char)line[0])) {
+                        strvec_add(&r->commands, trimmed);
+                    } else {
+                        fprintf(stderr, "%s:%d: error: rule command must be indented (tab or spaces)\n", filename, line_num);
+                        exit(1);
+                    }
                 }
                 r->next = ctx->rules;
                 ctx->rules = r;
             }
             continue;
         }
+
         if (strcmp(line, "eoc") == 0) { cur_cmd = NULL; in_flags = 0; cur_flag = NULL; continue; }
         if (!cur_cmd) {
             fprintf(stderr, "%s:%d: error: statement outside of any command/rule block: '%s'\n", filename, line_num, line);
@@ -664,15 +742,34 @@ void parse_umkfile(UmkCtx *ctx, const char *filename) {
             }
             continue;
         }
-        if (line[0] != '\t') {
-            strvec_add(&cur_cmd->commands, line);
-        }
+        strvec_add(&cur_cmd->commands, line);
     }
     if (in_flags || cur_cmd) {
         fprintf(stderr, "%s:%d: error: unexpected end of file (unclosed command or flag block)\n", filename, line_num);
         exit(1);
     }
     fclose(fp);
+}
+
+int execute_shell_safe(UmkCtx *ctx, const char *cmd_line) {
+    if (ctx->dry_run) {
+        printf("%s\n", cmd_line);
+        return 0;
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", cmd_line, (char *)NULL);
+        perror("execl");
+        exit(127);
+    } else if (pid > 0) {
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) return WEXITSTATUS(status);
+        return 1;
+    } else {
+        perror("fork");
+        return 1;
+    }
 }
 
 static int exec_command_list(UmkCtx *ctx, StrVec *cmds, int parallel_mode) {
@@ -685,12 +782,18 @@ static int exec_command_list(UmkCtx *ctx, StrVec *cmds, int parallel_mode) {
         trim(line);
         int ret;
         if (strncmp(line, "call ", 5) == 0) {
-            char *target = line + 5;
-            trim(target);
-            if (parallel_mode && ctx->parallel_jobs > 1) {
-                ret = execute_parallel(ctx, target);
-            } else {
-                ret = execute_serial(ctx, target);
+            char *targets = line + 5;
+            trim(targets);
+            char *saveptr;
+            char *tok = strtok_r(targets, " ", &saveptr);
+            while (tok) {
+                if (parallel_mode && ctx->parallel_jobs > 1) {
+                    ret = execute_parallel(ctx, tok);
+                } else {
+                    ret = execute_serial(ctx, tok);
+                }
+                if (ret != 0) return ret;
+                tok = strtok_r(NULL, " ", &saveptr);
             }
         } else {
             ret = execute_shell_safe(ctx, line);
@@ -722,6 +825,7 @@ int execute_serial(UmkCtx *ctx, const char *target_name) {
     strcpy(clean, target_name);
     trim(clean);
     if (strlen(clean) == 0) return 0;
+
     for (Command *c = ctx->commands; c; c = c->next) {
         if (strcmp(c->name, clean) != 0) continue;
         int ret = exec_flags_of_type(ctx, c, 0, 0);
@@ -730,6 +834,7 @@ int execute_serial(UmkCtx *ctx, const char *target_name) {
         if (ret != 0) return ret;
         return exec_flags_of_type(ctx, c, 1, 0);
     }
+
     for (Rule *r = ctx->rules; r; r = r->next) {
         if (!match_pattern(clean, r->target)) continue;
         StrVec actual_deps;
@@ -775,6 +880,7 @@ int execute_serial(UmkCtx *ctx, const char *target_name) {
         strvec_free(&actual_deps);
         return 0;
     }
+
     if (access(clean, F_OK) == 0) return 0;
     char msg[MAX_LINE];
     snprintf(msg, sizeof(msg), "Unknown target: %s", clean);
@@ -870,6 +976,7 @@ Job *build_job_graph(UmkCtx *ctx, const char *target, StrVec *path) {
     job->next = ctx->all_jobs;
     ctx->all_jobs = job;
     strvec_add(path, target);
+
     for (Command *c = ctx->commands; c; c = c->next) {
         if (strcmp(c->name, target) == 0) {
             job->cmd = c;
@@ -967,6 +1074,7 @@ int execute_parallel(UmkCtx *ctx, const char *target_name) {
     strcpy(clean, target_name);
     trim(clean);
     if (strlen(clean) == 0) return 0;
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_sigint;
@@ -975,11 +1083,13 @@ int execute_parallel(UmkCtx *ctx, const char *target_name) {
     ctx->all_jobs = NULL;
     ctx->ready_queue = NULL;
     ctx->ready_queue_size = ctx->ready_queue_capacity = ctx->jobs_running = ctx->build_failed = 0;
+
     StrVec path;
     strvec_init(&path);
     Job *root = build_job_graph(ctx, clean, &path);
     strvec_free(&path);
     if (!root) return 1;
+
     while ((ctx->ready_queue_size > 0 || ctx->jobs_running > 0) && !ctx->build_failed && !ctx->interrupted) {
         while (ctx->ready_queue_size > 0 && ctx->jobs_running < ctx->parallel_jobs && !ctx->build_failed && !ctx->interrupted) {
             Job *job = pop_ready_job(ctx);
@@ -987,7 +1097,10 @@ int execute_parallel(UmkCtx *ctx, const char *target_name) {
             job->state = 1;
             ctx->jobs_running++;
             pid_t pid = fork();
-            if (pid == 0) { int ret = run_job(ctx, job); exit(ret); }
+            if (pid == 0) {
+                int ret = run_job(ctx, job);
+                exit(ret);
+            }
             else if (pid > 0) job->pid = pid;
             else { perror("fork"); ctx->build_failed = 1; break; }
         }
@@ -1016,9 +1129,7 @@ int execute_parallel(UmkCtx *ctx, const char *target_name) {
                     mark_dependency_done(ctx, job);
                 }
             } else if (done < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
+                if (errno == EINTR) continue;
                 perror("waitpid");
                 ctx->build_failed = 1;
             }
@@ -1039,6 +1150,8 @@ void free_all(UmkCtx *ctx) {
     while (v) { Variable *next = v->next; free(v->value); free(v); v = next; }
     CacheEntry *ce = ctx->cache;
     while (ce) { CacheEntry *next = ce->next; free(ce); ce = next; }
+    RuntimeHash *rh = ctx->rt_hashes;
+    while (rh) { RuntimeHash *next = rh->next; free(rh); rh = next; }
 }
 
 int main(int argc, char **argv) {
@@ -1053,6 +1166,7 @@ int main(int argc, char **argv) {
     int max_flags = argc > 2 ? argc - 2 : 1;
     ctx.global_flags = malloc(max_flags * sizeof(char*));
     if (!ctx.global_flags) { perror("malloc"); return 1; }
+
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-j") == 0) {
             if (i + 1 < argc) {
@@ -1066,17 +1180,24 @@ int main(int argc, char **argv) {
         } else if (strncmp(argv[i], "-j", 2) == 0 && isdigit((unsigned char)argv[i][2])) {
             ctx.parallel_jobs = atoi(argv[i] + 2);
             ctx.j_from_cmdline = 1;
+        } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--dry-run") == 0) {
+            ctx.dry_run = 1;
+        } else if (strcmp(argv[i], "--no-color") == 0) {
+            ctx.use_color = 0;
         } else {
             ctx.global_flags[ctx.global_flag_count++] = argv[i];
         }
     }
+
     load_cache(&ctx);
     parse_umkfile(&ctx, "UMK");
     if (!ctx.j_from_cmdline) { if (ctx.parallel_auto) ctx.parallel_jobs = get_cpu_count(); }
     if (ctx.parallel_jobs < 1) ctx.parallel_jobs = 1;
+
     int ret;
     if (ctx.parallel_jobs > 1) ret = execute_parallel(&ctx, argv[1]);
     else ret = execute_serial(&ctx, argv[1]);
+
     save_cache(&ctx);
     free(ctx.global_flags);
     free_all(&ctx);
