@@ -20,6 +20,18 @@ A lightweight, zero-dependency parallel build system with clean syntax, designed
 - Dry-run mode — `-n`
 - Supports complex projects with multiple directories
 
+## Command Line Options
+
+| Option | Description |
+|--------|-------------|
+| `-j N`, `-jN` | Run N jobs in parallel |
+| `--jobs N`, `--jobs=N` | Same as `-j N` |
+| `--jobs auto` | Use the number of online CPUs |
+| `-n`, `--dry-run` | Show commands without executing |
+| `--no-color` | Disable colored output |
+| `-h`, `--help` | Show help |
+| `-v`, `--version` | Show version |
+
 ## Quick Start
 
 Create a `UMK` file in your project:
@@ -270,6 +282,66 @@ clean:
     rm -rf *.o */*.o *.bin
 eoc
 ```
+
+## Content Hash Cache
+
+umk uses a 128-bit UMK128 content hash.
+The hash database is stored in `.umk_cache`.
+
+umk does not use file timestamps for rebuild decisions.
+If file content changes, umk rebuilds the target.
+
+## Tests
+
+Run the test suite from the project directory:
+
+```sh
+sh tests/run.sh ./umk
+```
+
+## Fedora
+
+A Fedora spec file is available in `packaging/fedora/umk.spec`.
+
+### Build a local RPM
+
+Create a source tarball:
+
+```sh
+mkdir -p /tmp/umk-1.0.0/tests
+cp umk.c umk.1 README.md LICENSE /tmp/umk-1.0.0/
+cp tests/run.sh /tmp/umk-1.0.0/tests/
+tar czf umk-1.0.0.tar.gz -C /tmp umk-1.0.0
+```
+
+Prepare the RPM build tree:
+
+```sh
+mkdir -p ~/rpmbuild/SOURCES ~/rpmbuild/SPECS
+cp umk-1.0.0.tar.gz ~/rpmbuild/SOURCES/
+cp packaging/fedora/umk.spec ~/rpmbuild/SPECS/
+```
+
+Build the RPM:
+
+```sh
+rpmbuild -bb ~/rpmbuild/SPECS/umk.spec
+```
+
+Install the RPM:
+
+```sh
+sudo dnf install ~/rpmbuild/RPMS/$(uname -m)/umk-1.0.0-1.*.rpm
+```
+
+### Build a source RPM
+
+```sh
+rpmbuild -bs ~/rpmbuild/SPECS/umk.spec
+```
+
+For an official Fedora package, the spec file should use the real
+project URL and a valid Fedora packager identity in the changelog.
 
 ## License
 

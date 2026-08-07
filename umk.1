@@ -1,0 +1,115 @@
+.TH UMK 1 "June 2026" "umk 1.0.0" "User Commands"
+.SH NAME
+umk \- simple build system
+.SH SYNOPSIS
+.B umk
+[\fB\-j\fR \fIN\fR | \fB\-j\fIN\fR | \fB\-\-jobs\fR \fIN\fR | \fB\-\-jobs=\fIN\fR | \fB\-\-jobs auto\fR]
+[\fB\-n\fR | \fB\-\-dry\-run\fR]
+[\fB\-\-no\-color\fR]
+[\fB\-h\fR | \fB\-\-help\fR]
+[\fB\-v\fR | \fB\-\-version\fR]
+\fItarget\fR [\fIflags\fR...]
+.SH DESCRIPTION
+umk reads a UMK file in the current directory.
+umk builds the given target.
+.PP
+A target can be a rule target or a command target.
+A rule target can have file dependencies.
+A command target runs commands.
+A command target without dependencies is a phony target.
+.PP
+umk stores 128-bit content hashes in the file .umk_cache.
+umk uses these hashes to decide if a target needs a rebuild.
+.SH OPTIONS
+.TP
+.B \-j N
+Run N jobs in parallel.
+.TP
+.B \-\-jobs N
+Same as \fB\-j N\fR.
+.TP
+.B \-\-jobs=N
+Same as \fB\-j N\fR.
+.TP
+.B \-\-jobs auto
+Set the job count to the number of online CPUs.
+.TP
+.B \-h, \-\-help
+Show help.
+.TP
+.B \-v, \-\-version
+Show version.
+.TP
+.B \-n, \-\-dry\-run
+Print commands. Do not run them.
+.TP
+.B \-\-no\-color
+Disable colored output.
+.SH UMK FILE
+umk reads the file UMK.
+The file can define variables, rules, and commands.
+.PP
+Example rule:
+.PP
+.nf
+%.o: %.c
+    $(CC) $(CFLAGS) -c -o $@ $<
+eoc
+.fi
+.PP
+Example command:
+.PP
+.nf
+build:
+    call app
+    echo done
+eoc
+.fi
+.SH SPECIAL VARIABLES
+.TP
+.B $@
+Target name.
+.TP
+.B $<
+First dependency.
+.TP
+.B $^
+All dependencies.
+.SH FILES
+.TP
+.I UMK
+Input build file.
+.TP
+.I .umk_cache
+Content hash cache file.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Failure.
+.SH EXAMPLES
+Build a target:
+.PP
+.nf
+umk build
+.fi
+.PP
+Build with four jobs:
+.PP
+.nf
+umk build -j 4
+.fi
+.PP
+Show commands without execution:
+.PP
+.nf
+umk -n build
+.fi
+.PP
+Run a command with a user flag:
+.PP
+.nf
+umk build --clean
+.fi
