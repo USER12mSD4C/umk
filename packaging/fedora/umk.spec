@@ -1,6 +1,6 @@
 Name:           umk
 Version:        1.0.0
-Release:        %bcond_with check1%{?dist}
+Release:        1%{?dist}
 Summary:        Simple build system
 
 License:        MIT
@@ -26,9 +26,7 @@ install -Dpm 0755 umk %{buildroot}%{_bindir}/umk
 install -Dpm 0644 umk.1 %{buildroot}%{_mandir}/man1/umk.1
 
 %check
-%if %{with check}
 sh tests/run.sh ./umk
-%endif
 
 %files
 %license LICENSE
