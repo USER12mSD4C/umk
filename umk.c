@@ -176,7 +176,7 @@ typedef struct UmkCtx {
     int ready_queue_capacity;
     int jobs_running;
     int build_failed;
-    int interrupted;
+    volatile sig_atomic_t interrupted;
     StrVec done_commands;
 } UmkCtx;
 
@@ -265,7 +265,7 @@ static void umk_hash_block(UmkHash *h, const unsigned char *p) {
     h->h1 ^= rotl64(t, 37);
 
     h->h0 += h->h1 * 0x165667B19E3779F9ULL;
-    h->h1 += h->h0 * 0x85EBCA77C2B2AE63ULL;
+    h->h1 += h->h0 * 0x85EBCA77C2b2AE63ULL;
 }
 
 static void umk_hash_init(UmkHash *h) {
@@ -619,182 +619,375 @@ static int apply_pattern(const char *target, const char *pattern, char *out, siz
     return 1;
 }
 
-static void wildcard(const char *pattern, char *out, size_t out_size) {
-    out[0] = 0;
+static int has_wildcard_chars(const char *s) {
+    for (const char *p = s; *p; p++) {
+        if (*p == '*' || *p == '?') return 1;
+    }
+    return 0;
+}
 
-    DIR *d = opendir(".");
-    if (!d) return;
+static int match_name_pattern(const char *name, const char *pattern) {
+    const char *pp = pattern;
+    const char *nn = name;
 
-    struct dirent *e;
-    size_t len = 0;
+    while (*pp) {
+        if (*pp == '*') {
+            pp++;
+            if (!*pp) return 1;
 
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
+            while (*nn) {
+                if (match_name_pattern(nn, pp)) return 1;
+                nn++;
+            }
 
-        if (match_pattern(e->d_name, pattern)) {
-            size_t nlen = strlen(e->d_name);
-            if (len + nlen + 2 >= out_size) break;
-
-            if (len > 0) out[len++] = ' ';
-            strcpy(out + len, e->d_name);
-            len += nlen;
-            out[len] = 0;
+            return 0;
+        } else if (*pp == '?') {
+            if (!*nn) return 0;
+            pp++;
+            nn++;
+        } else {
+            if (*pp != *nn) return 0;
+            pp++;
+            nn++;
         }
     }
 
-    closedir(d);
+    return *nn == 0;
+}
+
+static int path_join(char *out, size_t out_size, const char *dir, const char *name) {
+    if (!out || out_size == 0 || !name) return 0;
+
+    size_t pos = 0;
+
+    if (dir && *dir && strcmp(dir, ".") != 0) {
+        size_t dlen = strlen(dir);
+
+        if (dlen >= out_size) return 0;
+
+        memcpy(out, dir, dlen);
+        pos = dlen;
+
+        if (out[pos - 1] != '/') {
+            if (pos + 1 >= out_size) return 0;
+            out[pos++] = '/';
+        }
+    }
+
+    size_t nlen = strlen(name);
+    if (pos + nlen + 1 > out_size) return 0;
+
+    memcpy(out + pos, name, nlen + 1);
+    return 1;
+}
+
+static void wildcard_scan_dir(const char *dir, const char *pattern, char *out, size_t out_size, size_t *len) {
+    if (!out || out_size == 0 || !pattern || !*pattern || !len) return;
+
+    const char *slash = strchr(pattern, '/');
+    char seg[MAX_LINE];
+    const char *rest = NULL;
+
+    if (slash) {
+        size_t seg_len = (size_t)(slash - pattern);
+        if (seg_len >= sizeof(seg)) seg_len = sizeof(seg) - 1;
+        memcpy(seg, pattern, seg_len);
+        seg[seg_len] = 0;
+
+        rest = slash + 1;
+        while (*rest == '/') rest++;
+        if (!*rest) rest = NULL;
+    } else {
+        strncpy(seg, pattern, sizeof(seg) - 1);
+        seg[sizeof(seg) - 1] = 0;
+    }
+
+    if (seg[0] == 0) return;
+
+    const char *scan_dir = (!dir || !*dir) ? "." : dir;
+
+    if (rest) {
+        if (has_wildcard_chars(seg)) {
+            DIR *d = opendir(scan_dir);
+            if (!d) return;
+
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+                if (seg[0] != '.' && e->d_name[0] == '.') continue;
+                if (!match_name_pattern(e->d_name, seg)) continue;
+
+                char path[MAX_LINE];
+                if (!path_join(path, sizeof(path), dir, e->d_name)) continue;
+
+                struct stat st;
+                if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    wildcard_scan_dir(path, rest, out, out_size, len);
+                }
+            }
+
+            closedir(d);
+        } else {
+            char path[MAX_LINE];
+            if (!path_join(path, sizeof(path), dir, seg)) return;
+
+            struct stat st;
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                wildcard_scan_dir(path, rest, out, out_size, len);
+            }
+        }
+    } else {
+        DIR *d = opendir(scan_dir);
+        if (!d) return;
+
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+            if (seg[0] != '.' && e->d_name[0] == '.') continue;
+            if (!match_name_pattern(e->d_name, seg)) continue;
+
+            char path[MAX_LINE];
+            if (!path_join(path, sizeof(path), dir, e->d_name)) continue;
+
+            struct stat st;
+            if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+                size_t nlen = strlen(path);
+
+                if (*len + nlen + 2 < out_size) {
+                    if (*len > 0) out[(*len)++] = ' ';
+                    memcpy(out + *len, path, nlen);
+                    *len += nlen;
+                    out[*len] = 0;
+                }
+            }
+        }
+
+        closedir(d);
+    }
+}
+
+static void wildcard_one(const char *pattern, char *out, size_t out_size, size_t *len) {
+    if (!pattern || !*pattern) return;
+
+    while (strncmp(pattern, "./", 2) == 0) pattern += 2;
+
+    if (pattern[0] == '/') {
+        const char *p = pattern;
+        while (*p == '/') p++;
+        if (!*p) return;
+        wildcard_scan_dir("/", p, out, out_size, len);
+    } else {
+        wildcard_scan_dir(".", pattern, out, out_size, len);
+    }
+}
+
+static void wildcard(const char *patterns, char *out, size_t out_size) {
+    if (out_size == 0) return;
+
+    out[0] = 0;
+    if (!patterns || !*patterns) return;
+
+    char *copy = xstrdup(patterns);
+    char *saveptr = NULL;
+    size_t len = 0;
+
+    for (char *pat = strtok_r(copy, " \t", &saveptr); pat; pat = strtok_r(NULL, " \t", &saveptr)) {
+        wildcard_one(pat, out, out_size, &len);
+    }
+
+    free(copy);
 }
 
 static void shell_cmd(const char *cmd, char *out, size_t out_size) {
+    if (out_size == 0) return;
+
     out[0] = 0;
+    if (!cmd || !*cmd) return;
 
     FILE *f = popen(cmd, "r");
     if (!f) return;
 
-    char line[MAX_LINE];
-    if (fgets(line, sizeof(line), f)) {
-        trim(line);
-        size_t len = strlen(line);
-        if (len >= out_size) len = out_size - 1;
-        memcpy(out, line, len);
+    size_t len = 0;
+    int c;
+
+    while ((c = fgetc(f)) != EOF && len < out_size - 1) {
+        if (c == '\n' || c == '\r') c = ' ';
+        out[len++] = (char)c;
         out[len] = 0;
     }
 
     pclose(f);
+    trim(out);
 }
 
-static void expand(UmkCtx *ctx, const char *str, char *out, size_t out_size) {
+#define UMK_EXPAND_MAX_DEPTH 32
+
+static const char *find_matching_paren(const char *open) {
+    int depth = 0;
+
+    for (const char *p = open; *p; p++) {
+        if (*p == '(') {
+            depth++;
+        } else if (*p == ')') {
+            depth--;
+            if (depth == 0) return p;
+        }
+    }
+
+    return NULL;
+}
+
+static size_t append_mem(char *out, size_t len, size_t out_size, const char *s, size_t n) {
+    if (out_size == 0) return 0;
+    if (len >= out_size) return len;
+
+    if (n >= out_size - len) n = out_size - len - 1;
+
+    memcpy(out + len, s, n);
+    len += n;
+    out[len] = 0;
+
+    return len;
+}
+
+static size_t append_char(char *out, size_t len, size_t out_size, char c) {
+    if (out_size == 0) return 0;
+    if (len >= out_size - 1) return len;
+
+    out[len++] = c;
+    out[len] = 0;
+
+    return len;
+}
+
+static void expand_depth(UmkCtx *ctx, const char *str, char *out, size_t out_size, int depth) {
     size_t len = 0;
+
+    if (out_size == 0) return;
     out[0] = 0;
 
+    if (!str || depth > UMK_EXPAND_MAX_DEPTH) return;
+
     const char *p = str;
+
     while (*p && len < out_size - 1) {
-        if (*p == '$' && p[1] == '$') {
-            out[len++] = '$';
+        if (p[0] == '$' && p[1] == '$') {
+            len = append_char(out, len, out_size, '$');
             p += 2;
-            out[len] = 0;
             continue;
         }
 
-        if (*p == '$' && p[1] == '(') {
-            const char *end = strchr(p, ')');
-            if (!end) break;
+        if (p[0] == '$' && p[1] == '(') {
+            const char *open = p + 1;
+            const char *close = find_matching_paren(open);
+            if (!close) break;
 
-            char inner[1024];
-            size_t ilen = (size_t)(end - p - 2);
-            if (ilen >= sizeof(inner)) ilen = sizeof(inner) - 1;
+            char raw[MAX_LINE];
+            size_t raw_len = (size_t)(close - (open + 1));
+            if (raw_len >= sizeof(raw)) raw_len = sizeof(raw) - 1;
 
-            strncpy(inner, p + 2, ilen);
-            inner[ilen] = 0;
+            memcpy(raw, open + 1, raw_len);
+            raw[raw_len] = 0;
 
-            char *space = strchr(inner, ' ');
-            char *subst = strchr(inner, ':');
+            char inner[MAX_LINE];
+            expand_depth(ctx, raw, inner, sizeof(inner), depth + 1);
+            trim(inner);
 
-            if (space && (!subst || space < subst)) {
-                *space = 0;
-                char *args = space + 1;
+            char result[MAX_LINE];
+            result[0] = 0;
 
-                if (strcmp(inner, "wildcard") == 0) {
-                    char w_buf[MAX_LINE];
-                    wildcard(args, w_buf, sizeof(w_buf));
+            const char *name_end = inner;
+            while (*name_end && !isspace((unsigned char)*name_end)) name_end++;
 
-                    size_t wlen = strlen(w_buf);
-                    if (len + wlen >= out_size) wlen = out_size - len - 1;
+            size_t fn_len = (size_t)(name_end - inner);
+            char func[MAX_NAME];
 
-                    memcpy(out + len, w_buf, wlen);
-                    len += wlen;
-                    out[len] = 0;
-                } else if (strcmp(inner, "shell") == 0) {
-                    char s_buf[MAX_LINE];
-                    shell_cmd(args, s_buf, sizeof(s_buf));
+            if (fn_len >= sizeof(func)) fn_len = sizeof(func) - 1;
 
-                    size_t slen = strlen(s_buf);
-                    if (len + slen >= out_size) slen = out_size - len - 1;
+            memcpy(func, inner, fn_len);
+            func[fn_len] = 0;
 
-                    memcpy(out + len, s_buf, slen);
-                    len += slen;
-                    out[len] = 0;
-                }
-            } else if (subst) {
-                *subst = 0;
-                char *var = inner;
-                char *rule = subst + 1;
-                char *eq = strchr(rule, '=');
+            const char *args = name_end;
+            while (*args && isspace((unsigned char)*args)) args++;
 
-                if (eq) {
-                    *eq = 0;
-                    char *from = rule;
-                    char *to = eq + 1;
-                    char *val = get_variable(ctx, var);
-
-                    if (val) {
-                        char temp_out[MAX_LINE];
-                        temp_out[0] = 0;
-                        size_t tlen = 0;
-
-                        char *saveptr;
-                        char *tok = strtok_r(val, " ", &saveptr);
-                        while (tok) {
-                            size_t t_len = strlen(tok);
-                            size_t f_len = strlen(from);
-                            int matches = 0;
-
-                            if (f_len == 0) {
-                                matches = 1;
-                            } else if (t_len >= f_len && strcmp(tok + t_len - f_len, from) == 0) {
-                                matches = 1;
-                            }
-
-                            if (matches) {
-                                size_t prefix_len = t_len - f_len;
-                                if (tlen + prefix_len + strlen(to) + 1 < sizeof(temp_out)) {
-                                    memcpy(temp_out + tlen, tok, prefix_len);
-                                    tlen += prefix_len;
-                                    strcpy(temp_out + tlen, to);
-                                    tlen += strlen(to);
-                                    temp_out[tlen++] = ' ';
-                                    temp_out[tlen] = 0;
-                                }
-                            } else {
-                                if (tlen + t_len + 1 < sizeof(temp_out)) {
-                                    memcpy(temp_out + tlen, tok, t_len);
-                                    tlen += t_len;
-                                    temp_out[tlen++] = ' ';
-                                    temp_out[tlen] = 0;
-                                }
-                            }
-
-                            tok = strtok_r(NULL, " ", &saveptr);
-                        }
-
-                        if (tlen > 0) temp_out[tlen - 1] = 0;
-
-                        size_t t_out_len = strlen(temp_out);
-                        if (len + t_out_len >= out_size) t_out_len = out_size - len - 1;
-
-                        memcpy(out + len, temp_out, t_out_len);
-                        len += t_out_len;
-                        out[len] = 0;
-                    }
-                }
+            if (strcmp(func, "wildcard") == 0) {
+                wildcard(args, result, sizeof(result));
+            } else if (strcmp(func, "shell") == 0) {
+                shell_cmd(args, result, sizeof(result));
             } else {
-                char *val = get_variable(ctx, inner);
-                if (val) {
-                    size_t vlen = strlen(val);
-                    if (len + vlen >= out_size) vlen = out_size - len - 1;
+                char work[MAX_LINE];
 
-                    memcpy(out + len, val, vlen);
-                    len += vlen;
-                    out[len] = 0;
+                strncpy(work, inner, sizeof(work) - 1);
+                work[sizeof(work) - 1] = 0;
+
+                char *subst = strchr(work, ':');
+
+                if (subst) {
+                    *subst = 0;
+
+                    char *var = work;
+                    char *rule = subst + 1;
+                    char *eq = strchr(rule, '=');
+
+                    if (eq) {
+                        *eq = 0;
+
+                        char *from = rule;
+                        char *to = eq + 1;
+                        char *val = get_variable(ctx, var);
+
+                        if (val) {
+                            char *copy = xstrdup(val);
+                            char *saveptr = NULL;
+                            size_t rlen = 0;
+
+                            for (char *tok = strtok_r(copy, " \t", &saveptr); tok; tok = strtok_r(NULL, " \t", &saveptr)) {
+                                size_t t_len = strlen(tok);
+                                size_t f_len = strlen(from);
+                                int matches = 0;
+
+                                if (f_len == 0) {
+                                    matches = 1;
+                                } else if (t_len >= f_len && strcmp(tok + t_len - f_len, from) == 0) {
+                                    matches = 1;
+                                }
+
+                                if (matches) {
+                                    size_t prefix_len = t_len - f_len;
+                                    rlen = append_mem(result, rlen, sizeof(result), tok, prefix_len);
+                                    rlen = append_mem(result, rlen, sizeof(result), to, strlen(to));
+                                } else {
+                                    rlen = append_mem(result, rlen, sizeof(result), tok, t_len);
+                                }
+
+                                rlen = append_char(result, rlen, sizeof(result), ' ');
+                            }
+
+                            if (rlen > 0 && result[rlen - 1] == ' ') result[rlen - 1] = 0;
+
+                            free(copy);
+                        }
+                    }
+                } else {
+                    char *val = get_variable(ctx, work);
+                    if (val) {
+                        strncpy(result, val, sizeof(result) - 1);
+                        result[sizeof(result) - 1] = 0;
+                    }
                 }
             }
 
-            p = end + 1;
+            len = append_mem(out, len, out_size, result, strlen(result));
+            p = close + 1;
         } else {
-            out[len++] = *p++;
-            out[len] = 0;
+            len = append_char(out, len, out_size, *p);
+            p++;
         }
     }
+}
+
+static void expand(UmkCtx *ctx, const char *str, char *out, size_t out_size) {
+    expand_depth(ctx, str, out, out_size, 0);
 }
 
 static void expand_autovars(const char *cmd, const char *target, StrVec *deps, char *out, size_t out_size) {
@@ -1034,9 +1227,23 @@ static void parse_umkfile(UmkCtx *ctx, const char *filename) {
             trim(target);
             trim(deps);
 
+            char exp_target[MAX_LINE];
+            expand(ctx, target, exp_target, sizeof(exp_target));
+            trim(exp_target);
+
+            if (strlen(exp_target) == 0 || strchr(exp_target, ' ') || strchr(exp_target, '\t')) {
+                fprintf(stderr, "%s:%d: error: invalid target name\n", filename, line_num);
+                exit(1);
+            }
+
             if (strlen(deps) == 0) {
+                if (strlen(exp_target) >= MAX_NAME) {
+                    fprintf(stderr, "%s:%d: error: command name too long\n", filename, line_num);
+                    exit(1);
+                }
+
                 Command *cmd = xmalloc(sizeof(Command));
-                strncpy(cmd->name, target, MAX_NAME - 1);
+                strncpy(cmd->name, exp_target, MAX_NAME - 1);
                 cmd->name[MAX_NAME - 1] = 0;
                 strvec_init(&cmd->commands);
                 cmd->flags = NULL;
@@ -1045,7 +1252,7 @@ static void parse_umkfile(UmkCtx *ctx, const char *filename) {
                 cur_cmd = cmd;
             } else {
                 Rule *r = xmalloc(sizeof(Rule));
-                r->target = xstrdup(target);
+                r->target = xstrdup(exp_target);
                 strvec_init(&r->deps);
                 strvec_init(&r->commands);
 
@@ -1053,10 +1260,10 @@ static void parse_umkfile(UmkCtx *ctx, const char *filename) {
                 expand(ctx, deps, exp_deps, sizeof(exp_deps));
 
                 char *copy = xstrdup(exp_deps);
-                char *tok = strtok(copy, " ");
+                char *tok = strtok(copy, " \t");
                 while (tok) {
                     strvec_add(&r->deps, tok);
-                    tok = strtok(NULL, " ");
+                    tok = strtok(NULL, " \t");
                 }
                 free(copy);
 
@@ -1147,6 +1354,44 @@ static void parse_umkfile(UmkCtx *ctx, const char *filename) {
         strvec_add(&cur_cmd->commands, line);
     }
 
+    Rule *rprev = NULL;
+    Rule *rcur = ctx->rules;
+
+    while (rcur) {
+        Rule *rnext = rcur->next;
+        rcur->next = rprev;
+        rprev = rcur;
+        rcur = rnext;
+    }
+
+    ctx->rules = rprev;
+
+    Command *cprev = NULL;
+    Command *ccur = ctx->commands;
+
+    while (ccur) {
+        Command *cnext = ccur->next;
+        ccur->next = cprev;
+        cprev = ccur;
+        ccur = cnext;
+    }
+
+    ctx->commands = cprev;
+
+    for (Command *c = ctx->commands; c; c = c->next) {
+        Flag *fprev = NULL;
+        Flag *fcur = c->flags;
+
+        while (fcur) {
+            Flag *fnext = fcur->next;
+            fcur->next = fprev;
+            fprev = fcur;
+            fcur = fnext;
+        }
+
+        c->flags = fprev;
+    }
+
     if (cond_ptr != 0) {
         fprintf(stderr, "%s:%d: error: unexpected end of file (unclosed conditional block)\n", filename, line_num);
         exit(1);
@@ -1194,9 +1439,36 @@ static Command *find_command(UmkCtx *ctx, const char *name) {
 
 static Rule *find_rule(UmkCtx *ctx, const char *name) {
     for (Rule *r = ctx->rules; r; r = r->next) {
-        if (match_pattern(name, r->target)) return r;
+        if (strcmp(r->target, name) == 0) return r;
     }
-    return NULL;
+
+    Rule *fallback = NULL;
+
+    for (Rule *r = ctx->rules; r; r = r->next) {
+        if (strcmp(r->target, name) == 0) continue;
+        if (!match_pattern(name, r->target)) continue;
+
+        if (!fallback) fallback = r;
+
+        StrVec deps;
+        strvec_init(&deps);
+        resolve_rule_deps(r, name, &deps);
+
+        int all_exist = 1;
+
+        for (int i = 0; i < deps.count; i++) {
+            if (access(deps.items[i], F_OK) != 0) {
+                all_exist = 0;
+                break;
+            }
+        }
+
+        strvec_free(&deps);
+
+        if (all_exist) return r;
+    }
+
+    return fallback;
 }
 
 static void substitute_stem(const char *pattern, const char *stem, char *out, size_t out_size) {
@@ -1248,9 +1520,7 @@ static int exec_flags_of_type(UmkCtx *ctx, Command *c, int type, int parallel_al
         for (int i = 0; i < ctx->global_flag_count; i++) {
             char *flag_name = ctx->global_flags[i];
 
-            if (flag_name[0] == '-') {
-                flag_name += (flag_name[1] == '-') ? 2 : 1;
-            }
+            while (*flag_name == '-' || *flag_name == '+') flag_name++;
 
             if (strcmp(f->name, flag_name) == 0) {
                 int ret = exec_command_list(ctx, &f->commands, parallel_allowed);
@@ -1282,12 +1552,12 @@ static int exec_command_list(UmkCtx *ctx, StrVec *cmds, int parallel_allowed) {
             trim(targets);
 
             char *saveptr;
-            char *tok = strtok_r(targets, " ", &saveptr);
+            char *tok = strtok_r(targets, " \t", &saveptr);
 
             while (tok) {
                 ret = execute_target(ctx, tok, parallel_allowed);
                 if (ret != 0) return ret;
-                tok = strtok_r(NULL, " ", &saveptr);
+                tok = strtok_r(NULL, " \t", &saveptr);
             }
         } else {
             ret = execute_shell_safe(ctx, line);
