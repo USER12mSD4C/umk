@@ -207,7 +207,7 @@ static Flag *parse_flag_line(const char *line);
 static int get_cpu_count(void);
 static Command *find_command(UmkCtx *ctx, const char *name);
 static Rule *find_rule(UmkCtx *ctx, const char *name);
-static void resolve_rule_deps(Rule *r, const char *target, StrVec *out);
+static void resolve_rule_deps(UmkCtx *ctx, Rule *r, const char *target, StrVec *out);
 static void add_ready_job(UmkCtx *ctx, Job *job);
 static Job *pop_ready_job(UmkCtx *ctx);
 static Job *find_job_by_pid(UmkCtx *ctx, pid_t pid);
@@ -218,6 +218,29 @@ static Job *build_rule_graph(UmkCtx *ctx, const char *target, StrVec *path, int 
 static int job_prepare_commands(UmkCtx *ctx, Job *job);
 static void handle_sigint(int sig);
 static void expand_autovars(const char *cmd, const char *target, StrVec *deps, char *out, size_t out_size);
+
+static void split_raw_tokens(const char *s, StrVec *out);
+static int try_run_assignment(UmkCtx *ctx, const char *line);
+static int ends_with(const char *s, const char *suffix);
+static int has_word(const char *s, const char *word);
+static void add_dependency_flags(const char *target, char *cmd, size_t cmd_size);
+static int depfile_for_target(const char *target, char *out, size_t out_size);
+static void parse_depfile(const char *path, StrVec *out);
+static void add_depfile_deps(const char *target, StrVec *deps);
+static int missing_depfile_for_object(const char *target, StrVec *deps);
+static void hash_strvec(StrVec *v, char out[UMK_HASH_HEX]);
+static int dep_list_cache_key(const char *target, char *out, size_t out_size);
+
+static int has_wildcard_chars(const char *s);
+static int match_name_pattern(const char *name, const char *pattern);
+static int path_join(char *out, size_t out_size, const char *dir, const char *name);
+static void wildcard_scan_dir(const char *dir, const char *pattern, char *out, size_t out_size, size_t *len);
+static void wildcard_one(const char *pattern, char *out, size_t out_size, size_t *len);
+
+static const char *find_matching_paren(const char *open);
+static size_t append_mem(char *out, size_t len, size_t out_size, const char *s, size_t n);
+static size_t append_char(char *out, size_t len, size_t out_size, char c);
+static void expand_depth(UmkCtx *ctx, const char *str, char *out, size_t out_size, int depth);
 
 typedef struct UmkHash {
     uint64_t h0;
@@ -265,7 +288,7 @@ static void umk_hash_block(UmkHash *h, const unsigned char *p) {
     h->h1 ^= rotl64(t, 37);
 
     h->h0 += h->h1 * 0x165667B19E3779F9ULL;
-    h->h1 += h->h0 * 0x85EBCA77C2b2AE63ULL;
+    h->h1 += h->h0 * 0x85EBCA77C2B2AE63ULL;
 }
 
 static void umk_hash_init(UmkHash *h) {
@@ -462,6 +485,34 @@ static int get_current_hash(UmkCtx *ctx, const char *path, char out[UMK_HASH_HEX
     return 0;
 }
 
+static void hash_strvec(StrVec *v, char out[UMK_HASH_HEX]) {
+    UmkHash h;
+    umk_hash_init(&h);
+
+    if (v) {
+        for (int i = 0; i < v->count; i++) {
+            char sep = 0;
+            umk_hash_update(&h, &sep, 1);
+            umk_hash_update(&h, v->items[i], strlen(v->items[i]));
+        }
+    }
+
+    umk_hash_final(&h, out);
+}
+
+static int dep_list_cache_key(const char *target, char *out, size_t out_size) {
+    size_t tlen = strlen(target);
+    const char *suffix = " deps";
+    size_t slen = strlen(suffix);
+
+    if (tlen + slen + 1 > out_size) return 0;
+
+    memcpy(out, target, tlen);
+    memcpy(out + tlen, suffix, slen + 1);
+
+    return 1;
+}
+
 static int needs_rebuild(UmkCtx *ctx, const char *target, StrVec *deps) {
     char cur[UMK_HASH_HEX];
 
@@ -470,6 +521,15 @@ static int needs_rebuild(UmkCtx *ctx, const char *target, StrVec *deps) {
 
     const char *cached = get_cached_hash(ctx, target);
     if (!cached || strcmp(cur, cached) != 0) return 1;
+
+    char depkey[MAX_LINE];
+    if (!dep_list_cache_key(target, depkey, sizeof(depkey))) return 1;
+
+    char list_hash[UMK_HASH_HEX];
+    hash_strvec(deps, list_hash);
+
+    cached = get_cached_hash(ctx, depkey);
+    if (!cached || strcmp(list_hash, cached) != 0) return 1;
 
     for (int i = 0; i < deps->count; i++) {
         const char *dep = deps->items[i];
@@ -489,6 +549,13 @@ static void mark_rebuilt(UmkCtx *ctx, const char *target, StrVec *deps) {
 
     if (umk_hash_file(target, h) == 0) {
         set_cached_hash(ctx, target, h);
+    }
+
+    char depkey[MAX_LINE];
+    if (dep_list_cache_key(target, depkey, sizeof(depkey))) {
+        char list_hash[UMK_HASH_HEX];
+        hash_strvec(deps, list_hash);
+        set_cached_hash(ctx, depkey, list_hash);
     }
 
     for (int i = 0; i < deps->count; i++) {
@@ -1082,6 +1149,56 @@ static Flag *parse_flag_line(const char *line) {
     return f;
 }
 
+static void split_raw_tokens(const char *s, StrVec *out) {
+    char token[MAX_LINE];
+    size_t len = 0;
+    int depth = 0;
+    int escaped = 0;
+
+    const char *p = s;
+
+    while (*p) {
+        char c = *p;
+
+        if (escaped) {
+            if (len < sizeof(token) - 1) token[len++] = c;
+            escaped = 0;
+            p++;
+            continue;
+        }
+
+        if (c == '\\') {
+            escaped = 1;
+            if (len < sizeof(token) - 1) token[len++] = c;
+            p++;
+            continue;
+        }
+
+        if (c == '(' && len > 0 && token[len - 1] == '$') {
+            depth++;
+        } else if (c == ')' && depth > 0) {
+            depth--;
+        }
+
+        if (depth == 0 && isspace((unsigned char)c)) {
+            if (len > 0) {
+                token[len] = 0;
+                strvec_add(out, token);
+                len = 0;
+            }
+        } else {
+            if (len < sizeof(token) - 1) token[len++] = c;
+        }
+
+        p++;
+    }
+
+    if (len > 0) {
+        token[len] = 0;
+        strvec_add(out, token);
+    }
+}
+
 static void parse_umkfile(UmkCtx *ctx, const char *filename) {
     FILE *fp = fopen(filename, "r");
     if (!fp) {
@@ -1256,16 +1373,7 @@ static void parse_umkfile(UmkCtx *ctx, const char *filename) {
                 strvec_init(&r->deps);
                 strvec_init(&r->commands);
 
-                char exp_deps[MAX_LINE];
-                expand(ctx, deps, exp_deps, sizeof(exp_deps));
-
-                char *copy = xstrdup(exp_deps);
-                char *tok = strtok(copy, " \t");
-                while (tok) {
-                    strvec_add(&r->deps, tok);
-                    tok = strtok(NULL, " \t");
-                }
-                free(copy);
+                split_raw_tokens(deps, &r->deps);
 
                 int found_eoc = 0;
 
@@ -1437,6 +1545,247 @@ static Command *find_command(UmkCtx *ctx, const char *name) {
     return NULL;
 }
 
+static int ends_with(const char *s, const char *suffix) {
+    size_t slen = strlen(s);
+    size_t xlen = strlen(suffix);
+
+    if (xlen > slen) return 0;
+
+    return strcmp(s + slen - xlen, suffix) == 0;
+}
+
+static int has_word(const char *s, const char *word) {
+    size_t wlen = strlen(word);
+    const char *p = s;
+
+    while (*p) {
+        while (isspace((unsigned char)*p)) p++;
+
+        const char *start = p;
+
+        while (*p && !isspace((unsigned char)*p)) p++;
+
+        if ((size_t)(p - start) == wlen && strncmp(start, word, wlen) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void add_dependency_flags(const char *target, char *cmd, size_t cmd_size) {
+    if (!target || !cmd || !ends_with(target, ".o")) return;
+    if (!has_word(cmd, "-c")) return;
+
+    if (has_word(cmd, "-MMD") || has_word(cmd, "-MD") ||
+        has_word(cmd, "-MM") || has_word(cmd, "-M")) {
+        return;
+    }
+
+    size_t len = strlen(cmd);
+    const char *add = " -MMD -MP";
+    size_t alen = strlen(add);
+
+    if (len + alen + 1 > cmd_size) return;
+
+    memcpy(cmd + len, add, alen + 1);
+}
+
+static int depfile_for_target(const char *target, char *out, size_t out_size) {
+    size_t tlen = strlen(target);
+
+    if (tlen > 2 && strcmp(target + tlen - 2, ".o") == 0) {
+        if (tlen + 1 > out_size) return 0;
+
+        memcpy(out, target, tlen - 2);
+        memcpy(out + tlen - 2, ".d", 3);
+
+        return 1;
+    }
+
+    if (tlen + 3 > out_size) return 0;
+
+    memcpy(out, target, tlen);
+    memcpy(out + tlen, ".d", 3);
+
+    return 1;
+}
+
+static void parse_depfile(const char *path, StrVec *out) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    int c;
+    int after_colon = 0;
+    int escaped = 0;
+
+    char token[MAX_LINE];
+    size_t tlen = 0;
+
+    while ((c = fgetc(f)) != EOF) {
+        if (escaped) {
+            if (c == '\n') {
+                escaped = 0;
+                continue;
+            }
+
+            if (tlen < sizeof(token) - 1) {
+                if (c == ' ' || c == '#' || c == '\\') {
+                    token[tlen++] = (char)c;
+                } else {
+                    if (tlen + 2 < sizeof(token) - 1) {
+                        token[tlen++] = '\\';
+                        token[tlen++] = (char)c;
+                    }
+                }
+            }
+
+            escaped = 0;
+            continue;
+        }
+
+        if (c == '\\') {
+            escaped = 1;
+            continue;
+        }
+
+        if (!after_colon) {
+            if (c == ':') after_colon = 1;
+            continue;
+        }
+
+        if (c == '\n') {
+            if (tlen > 0) {
+                token[tlen] = 0;
+
+                if (!strvec_contains(out, token)) {
+                    strvec_add(out, token);
+                }
+
+                tlen = 0;
+            }
+
+            after_colon = 0;
+        } else if (isspace((unsigned char)c)) {
+            if (tlen > 0) {
+                token[tlen] = 0;
+
+                if (!strvec_contains(out, token)) {
+                    strvec_add(out, token);
+                }
+
+                tlen = 0;
+            }
+        } else {
+            if (tlen < sizeof(token) - 1) {
+                token[tlen++] = (char)c;
+            }
+        }
+    }
+
+    if (after_colon && tlen > 0) {
+        token[tlen] = 0;
+
+        if (!strvec_contains(out, token)) {
+            strvec_add(out, token);
+        }
+    }
+
+    fclose(f);
+}
+
+static void add_depfile_deps(const char *target, StrVec *deps) {
+    char depfile[MAX_LINE];
+
+    if (!depfile_for_target(target, depfile, sizeof(depfile))) return;
+    if (access(depfile, F_OK) != 0) return;
+
+    StrVec extra;
+    strvec_init(&extra);
+    parse_depfile(depfile, &extra);
+
+    for (int i = 0; i < extra.count; i++) {
+        if (!strvec_contains(deps, extra.items[i])) {
+            strvec_add(deps, extra.items[i]);
+        }
+    }
+
+    strvec_free(&extra);
+}
+
+static int missing_depfile_for_object(const char *target, StrVec *deps) {
+    if (!ends_with(target, ".o")) return 0;
+
+    char depfile[MAX_LINE];
+
+    if (!depfile_for_target(target, depfile, sizeof(depfile))) return 0;
+    if (access(depfile, F_OK) == 0) return 0;
+
+    for (int i = 0; i < deps->count; i++) {
+        const char *dep = deps->items[i];
+
+        if (ends_with(dep, ".c") || ends_with(dep, ".cpp") ||
+            ends_with(dep, ".cc") || ends_with(dep, ".cxx")) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int try_run_assignment(UmkCtx *ctx, const char *line) {
+    const char *p = line;
+
+    if (!(isalpha((unsigned char)*p) || *p == '_')) return 0;
+
+    char name[MAX_NAME];
+    size_t n = 0;
+
+    while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
+        if (n < sizeof(name) - 1) name[n++] = *p;
+        p++;
+    }
+
+    name[n] = 0;
+
+    while (isspace((unsigned char)*p)) p++;
+
+    int is_append = 0;
+
+    if (*p == '+') {
+        is_append = 1;
+        p++;
+        while (isspace((unsigned char)*p)) p++;
+    }
+
+    if (*p != '=') return 0;
+
+    p++;
+
+    while (isspace((unsigned char)*p)) p++;
+
+    char exp_val[MAX_LINE];
+    expand(ctx, p, exp_val, sizeof(exp_val));
+    trim(exp_val);
+
+    if (is_append) {
+        char *old = get_variable(ctx, name);
+        char new_val[MAX_LINE * 2];
+
+        if (old) {
+            snprintf(new_val, sizeof(new_val), "%s %s", old, exp_val);
+        } else {
+            snprintf(new_val, sizeof(new_val), "%s", exp_val);
+        }
+
+        add_variable(ctx, name, new_val);
+    } else {
+        add_variable(ctx, name, exp_val);
+    }
+
+    return 1;
+}
+
 static Rule *find_rule(UmkCtx *ctx, const char *name) {
     for (Rule *r = ctx->rules; r; r = r->next) {
         if (strcmp(r->target, name) == 0) return r;
@@ -1452,7 +1801,7 @@ static Rule *find_rule(UmkCtx *ctx, const char *name) {
 
         StrVec deps;
         strvec_init(&deps);
-        resolve_rule_deps(r, name, &deps);
+        resolve_rule_deps(ctx, r, name, &deps);
 
         int all_exist = 1;
 
@@ -1489,7 +1838,7 @@ static void substitute_stem(const char *pattern, const char *stem, char *out, si
     out[pos] = 0;
 }
 
-static void resolve_rule_deps(Rule *r, const char *target, StrVec *out) {
+static void resolve_rule_deps(UmkCtx *ctx, Rule *r, const char *target, StrVec *out) {
     char stem[MAX_LINE] = "";
     int has_stem = 0;
 
@@ -1498,18 +1847,29 @@ static void resolve_rule_deps(Rule *r, const char *target, StrVec *out) {
     }
 
     for (int i = 0; i < r->deps.count; i++) {
-        char buf[MAX_LINE];
+        char expanded[MAX_LINE];
 
-        if (has_stem) {
-            substitute_stem(r->deps.items[i], stem, buf, sizeof(buf));
-        } else {
-            strncpy(buf, r->deps.items[i], sizeof(buf) - 1);
-            buf[sizeof(buf) - 1] = 0;
+        expand(ctx, r->deps.items[i], expanded, sizeof(expanded));
+
+        char *copy = xstrdup(expanded);
+        char *saveptr = NULL;
+
+        for (char *tok = strtok_r(copy, " \t", &saveptr); tok; tok = strtok_r(NULL, " \t", &saveptr)) {
+            char buf[MAX_LINE];
+
+            if (has_stem) {
+                substitute_stem(tok, stem, buf, sizeof(buf));
+            } else {
+                strncpy(buf, tok, sizeof(buf) - 1);
+                buf[sizeof(buf) - 1] = 0;
+            }
+
+            if (!strvec_contains(out, buf)) {
+                strvec_add(out, buf);
+            }
         }
 
-        if (!strvec_contains(out, buf)) {
-            strvec_add(out, buf);
-        }
+        free(copy);
     }
 }
 
@@ -1535,6 +1895,8 @@ static int exec_flags_of_type(UmkCtx *ctx, Command *c, int type, int parallel_al
 
 static int exec_command_list(UmkCtx *ctx, StrVec *cmds, int parallel_allowed) {
     for (int i = 0; i < cmds->count; i++) {
+        if (try_run_assignment(ctx, cmds->items[i])) continue;
+
         char exp[MAX_LINE];
         expand(ctx, cmds->items[i], exp, sizeof(exp));
 
@@ -1571,7 +1933,7 @@ static int exec_command_list(UmkCtx *ctx, StrVec *cmds, int parallel_allowed) {
 static int execute_command_by_name(UmkCtx *ctx, const char *name, int parallel_allowed) {
     Command *c = find_command(ctx, name);
     if (!c) {
-        char msg[MAX_LINE];
+        char msg[MAX_LINE + 128];
         snprintf(msg, sizeof(msg), "Unknown command: %s", name);
         print_color(ctx, COLOR_RED, msg);
         return 1;
@@ -1589,7 +1951,7 @@ static int execute_command_by_name(UmkCtx *ctx, const char *name, int parallel_a
 static int execute_serial_rule(UmkCtx *ctx, const char *target) {
     Rule *r = find_rule(ctx, target);
     if (!r) {
-        char msg[MAX_LINE];
+        char msg[MAX_LINE + 128];
         snprintf(msg, sizeof(msg), "Unknown rule target: %s", target);
         print_color(ctx, COLOR_RED, msg);
         return 1;
@@ -1597,7 +1959,8 @@ static int execute_serial_rule(UmkCtx *ctx, const char *target) {
 
     StrVec actual_deps;
     strvec_init(&actual_deps);
-    resolve_rule_deps(r, target, &actual_deps);
+    resolve_rule_deps(ctx, r, target, &actual_deps);
+    add_depfile_deps(target, &actual_deps);
 
     for (int i = 0; i < actual_deps.count; i++) {
         int ret = execute_target(ctx, actual_deps.items[i], 0);
@@ -1607,7 +1970,13 @@ static int execute_serial_rule(UmkCtx *ctx, const char *target) {
         }
     }
 
-    if (!needs_rebuild(ctx, target, &actual_deps) && !ctx->dry_run) {
+    int dirty = ctx->dry_run ? 1 : needs_rebuild(ctx, target, &actual_deps);
+
+    if (!dirty && missing_depfile_for_object(target, &actual_deps)) {
+        dirty = 1;
+    }
+
+    if (!dirty) {
         strvec_free(&actual_deps);
         return 0;
     }
@@ -1618,6 +1987,7 @@ static int execute_serial_rule(UmkCtx *ctx, const char *target) {
 
         char final_cmd[MAX_LINE];
         expand(ctx, expanded, final_cmd, sizeof(final_cmd));
+        add_dependency_flags(target, final_cmd, sizeof(final_cmd));
 
         int ret = execute_shell_safe(ctx, final_cmd);
         if (ret != 0) {
@@ -1627,6 +1997,7 @@ static int execute_serial_rule(UmkCtx *ctx, const char *target) {
     }
 
     if (!ctx->dry_run) {
+        add_depfile_deps(target, &actual_deps);
         mark_rebuilt(ctx, target, &actual_deps);
     }
 
@@ -1659,7 +2030,11 @@ static int execute_target(UmkCtx *ctx, const char *target, int parallel_allowed)
 
     if (access(clean, F_OK) == 0) return 0;
 
-    char msg[MAX_LINE];
+    if (ends_with(clean, ".h") || ends_with(clean, ".hpp")) {
+        return 0;
+    }
+
+    char msg[MAX_LINE + 128];
     snprintf(msg, sizeof(msg), "Unknown target: %s", clean);
     print_color(ctx, COLOR_RED, msg);
     return 1;
@@ -1797,13 +2172,13 @@ static Job *build_rule_graph(UmkCtx *ctx, const char *target, StrVec *path, int 
     ctx->all_jobs = job;
 
     if (!r) {
-        if (access(target, F_OK) == 0) {
+        if (access(target, F_OK) == 0 || ends_with(target, ".h") || ends_with(target, ".hpp")) {
             job->kind = JOB_FILE;
             job->deps_remaining = 0;
             return job;
         }
 
-        char msg[MAX_LINE];
+        char msg[MAX_LINE + 128];
         snprintf(msg, sizeof(msg), "Unknown target: %s", target);
         print_color(ctx, COLOR_RED, msg);
         *err = 1;
@@ -1817,7 +2192,8 @@ static Job *build_rule_graph(UmkCtx *ctx, const char *target, StrVec *path, int 
 
     StrVec deps;
     strvec_init(&deps);
-    resolve_rule_deps(r, target, &deps);
+    resolve_rule_deps(ctx, r, target, &deps);
+    add_depfile_deps(target, &deps);
 
     for (int i = 0; i < deps.count; i++) {
         const char *dep = deps.items[i];
@@ -1859,6 +2235,7 @@ static int job_prepare_commands(UmkCtx *ctx, Job *job) {
 
         char final_cmd[MAX_LINE];
         expand(ctx, expanded, final_cmd, sizeof(final_cmd));
+        add_dependency_flags(job->target, final_cmd, sizeof(final_cmd));
 
         strvec_add(&job->final_cmds, final_cmd);
     }
@@ -1956,7 +2333,14 @@ static int execute_parallel_rule(UmkCtx *ctx, const char *target_name) {
             }
 
             int dirty = job->forced;
-            if (!dirty) dirty = needs_rebuild(ctx, job->target, &job->deps);
+
+            if (!dirty && !ctx->dry_run) {
+                dirty = needs_rebuild(ctx, job->target, &job->deps);
+            }
+
+            if (!dirty && !ctx->dry_run && missing_depfile_for_object(job->target, &job->deps)) {
+                dirty = 1;
+            }
 
             if (!dirty && !ctx->dry_run) {
                 job->state = 2;
@@ -2023,13 +2407,14 @@ static int execute_parallel_rule(UmkCtx *ctx, const char *target_name) {
 
                     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
                         job->state = 2;
+                        add_depfile_deps(job->target, &job->deps);
                         mark_rebuilt(ctx, job->target, &job->deps);
                         mark_dependency_done(ctx, job);
                     } else {
                         job->state = 2;
                         ctx->build_failed = 1;
 
-                        char msg[MAX_LINE];
+                        char msg[MAX_LINE + 128];
                         if (WIFEXITED(status)) {
                             snprintf(msg, sizeof(msg), "Job %s failed with exit code %d", job->target, WEXITSTATUS(status));
                         } else {
